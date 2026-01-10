@@ -1,0 +1,6 @@
+
+Directory: .
+Averages by strategy:
+multiple-tokens st=0.85 mt=0.33 avg_tpt=0.1289s avg_total=18.037s avg_verifications=18.9 gpu_energy=59.16J gpu_power_int=54.65J task_energy=56.25J (n=11, all) file=edgeLLM_alpha=0.9_mult=0.8_bw=10MB.json
+multiple-tokens st=0.85 mt=0.39 avg_tpt=0.1269s avg_total=18.151s avg_verifications=19.8 gpu_energy=61.73J gpu_power_int=48.01J task_energy=56.53J (n=10, all) file=edgeLLM_alpha=0.95_mult=0.8_bw=10MB.json
+Saved c:\files\SpeculativeDecoding-final_one_machine\exp_little\humaneval\edgeLLM\multiple_tokens_vs_thresh.png

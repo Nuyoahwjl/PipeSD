@@ -1,0 +1,31 @@
+Bandwidth 1MB (relative to pipesd)
+method                    | pipesd vs method avg_tpt | pipesd vs method gpu_power_int | pipesd vs method gpu_energy
+--------------------------+--------------------------+--------------------------------+----------------------------
+edgeLLM (multiple-tokens) | +7.15%                   | +24.52%                        | +16.32%                    
+hsl st=0.99 mt=0.90       | +1.66%                   | +22.99%                        | +13.65%                    
+pipesd (hybrid)           | baseline                 | baseline                       | baseline                   
+vanilla (fixed-num)       | +22.42%                  | +13.89%                        | -0.98%                     
+
+Bandwidth 5MB (relative to pipesd)
+method                    | pipesd vs method avg_tpt | pipesd vs method gpu_power_int | pipesd vs method gpu_energy
+--------------------------+--------------------------+--------------------------------+----------------------------
+edgeLLM (multiple-tokens) | +11.25%                  | +15.54%                        | +21.34%                    
+hsl st=0.99 mt=0.90       | +20.93%                  | +21.85%                        | +32.79%                    
+pipesd (hybrid)           | baseline                 | baseline                       | baseline                   
+vanilla (fixed-num)       | +31.06%                  | +22.92%                        | +30.70%                    
+
+Bandwidth 10MB (relative to pipesd)
+method                    | pipesd vs method avg_tpt | pipesd vs method gpu_power_int | pipesd vs method gpu_energy
+--------------------------+--------------------------+--------------------------------+----------------------------
+edgeLLM (multiple-tokens) | +12.19%                  | +29.00%                        | +32.93%                    
+hsl st=0.99 mt=0.90       | +17.09%                  | +15.76%                        | +24.58%                    
+pipesd (hybrid)           | baseline                 | baseline                       | baseline                   
+vanilla (fixed-num)       | +25.11%                  | +33.11%                        | +28.95%                    
+
+Bandwidth unknown (relative to pipesd)
+method                    | pipesd vs method avg_tpt | pipesd vs method gpu_power_int | pipesd vs method gpu_energy
+--------------------------+--------------------------+--------------------------------+----------------------------
+edgeLLM (multiple-tokens) | +30.20%                  | +14.58%                        | +10.32%                    
+hsl st=0.99 mt=0.90       | +15.05%                  | +19.82%                        | +13.49%                    
+pipesd (hybrid)           | baseline                 | baseline                       | baseline                   
+vanilla (fixed-num)       | +32.04%                  | +16.37%                        | +8.34%                     

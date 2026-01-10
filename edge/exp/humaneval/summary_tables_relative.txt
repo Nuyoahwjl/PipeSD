@@ -1,0 +1,31 @@
+Bandwidth 1MB (relative to vanilla)
+method                    | avg_tpt vs vanilla | gpu_power_int vs vanilla | gpu_energy vs vanilla
+--------------------------+--------------------+--------------------------+----------------------
+edgeLLM (multiple-tokens) | +16.45%            | -14.09%                  | -20.68%              
+hsl st=0.99 mt=0.90       | +21.11%            | -11.81%                  | -16.95%              
+pipesd (hybrid)           | +22.42%            | +13.89%                  | -0.98%               
+vanilla (fixed-num)       | baseline           | baseline                 | baseline             
+
+Bandwidth 5MB (relative to vanilla)
+method                    | avg_tpt vs vanilla | gpu_power_int vs vanilla | gpu_energy vs vanilla
+--------------------------+--------------------+--------------------------+----------------------
+edgeLLM (multiple-tokens) | +22.32%            | +8.75%                   | +11.90%              
+hsl st=0.99 mt=0.90       | +12.80%            | +1.38%                   | -3.11%               
+pipesd (hybrid)           | +31.06%            | +22.92%                  | +30.70%              
+vanilla (fixed-num)       | baseline           | baseline                 | baseline             
+
+Bandwidth 10MB (relative to vanilla)
+method                    | avg_tpt vs vanilla | gpu_power_int vs vanilla | gpu_energy vs vanilla
+--------------------------+--------------------+--------------------------+----------------------
+edgeLLM (multiple-tokens) | +14.71%            | +5.79%                   | -5.94%               
+hsl st=0.99 mt=0.90       | +9.66%             | +20.60%                  | +5.79%               
+pipesd (hybrid)           | +25.11%            | +33.11%                  | +28.95%              
+vanilla (fixed-num)       | baseline           | baseline                 | baseline             
+
+Bandwidth unknown (relative to vanilla)
+method                    | avg_tpt vs vanilla | gpu_power_int vs vanilla | gpu_energy vs vanilla
+--------------------------+--------------------+--------------------------+----------------------
+edgeLLM (multiple-tokens) | +2.64%             | +2.09%                   | -2.20%               
+hsl st=0.99 mt=0.90       | +20.00%            | -4.30%                   | -5.95%               
+pipesd (hybrid)           | +32.04%            | +16.37%                  | +8.34%               
+vanilla (fixed-num)       | baseline           | baseline                 | baseline             

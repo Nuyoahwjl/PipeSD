@@ -1,0 +1,297 @@
+# eval_humaneval.py
+import os
+import sys
+sys.path.append(os.path.join(sys.path[0], "../"))
+import torch
+import time
+import json
+import itertools
+from pathlib import Path
+from tqdm import tqdm
+from multiprocessing import Queue, Process
+
+from src.util import seed_everything, parse_arguments
+from src.engine import Decoding
+import torch.multiprocessing as mp
+from skopt import gp_minimize
+from skopt.space import Real
+
+try:
+    from llama_cpp import Llama, llama_cpp
+    GGUF_SUPPORT = True
+except ImportError:
+    GGUF_SUPPORT = False
+    print("Warning: llama-cpp-python not found. GGUF model support disabled.")
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+
+# 1. 更改类名，使其更贴切
+class CloudEdgeSpeculativeEval(Decoding):
+    def __init__(self, args):
+        # 将队列的创建也移到这里，作为类的属性
+        self.request_queue = Queue()
+        self.response_queue = Queue()
+        super().__init__(args)
+        self.samples = self.load_data()
+
+    def load_data(self):
+        """
+        从文件中加载并返回数据样本。
+        """
+        self.color_print(f"[Main] Loading data ({self.args.dataset}) from: {self.args.data_path}", 3)
+        try:
+            with open(self.args.data_path, "r", encoding="utf-8") as f:
+                raw_samples = [json.loads(line) for line in f]
+
+            dataset = getattr(self.args, "dataset", "").lower()
+            if dataset == "mt_bench":
+                samples = self._load_mt_bench_samples(raw_samples)
+            elif dataset == "humaneval":
+                samples = self._load_humaneval_samples(raw_samples)
+            elif dataset == "gsm8k":
+                samples = self._load_gsm8k_samples(raw_samples)
+            else:
+                self.color_print(f"[Main] 未知数据集 {self.args.dataset}，默认使用 humaneval 解析格式。", 1)
+                samples = self._load_humaneval_samples(raw_samples)
+
+            samples = samples[self.start_index_of_sample:self.end_index_of_sample+1]
+            self.color_print(f"[Main] Loaded {len(samples)} samples.", 3)
+            return samples
+        except Exception as e:
+            print(f"[Main] Error loading data: {e}")
+            return [] # 如果加载失败，返回空列表以避免崩溃
+
+    def _load_humaneval_samples(self, raw_samples):
+        samples = []
+        for idx, item in enumerate(raw_samples):
+            prompt = item.get("prompt")
+            if prompt is None:
+                self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 prompt 字段", 1)
+                continue
+            task_id = item.get("task_id", item.get("question_id", idx))
+            samples.append({"prompt": prompt, "task_id": task_id})
+        return samples
+
+    def _load_mt_bench_samples(self, raw_samples):
+        samples = []
+        for idx, item in enumerate(raw_samples):
+            turns = item.get("turns", [])
+            if not turns:
+                self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 turns 字段", 1)
+                continue
+            task_id = item.get("question_id", idx)
+            samples.append(
+                {
+                    "category": item.get("category", ""),
+                    "turns": turns,
+                    "task_id": task_id,
+                }
+            )
+        return samples
+
+    def _load_gsm8k_samples(self, raw_samples):
+        samples = []
+        for idx, item in enumerate(raw_samples):
+            question = item.get("question")
+            if question is None:
+                self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 question 字段", 1)
+                continue
+            # GSM8K 不包含显式 id，这里按顺序分配 task_id
+            samples.append({"prompt": question, "task_id": idx})
+        return samples
+    
+    # 2. 在 Decoding 基类中添加新的进程函数签名
+    # (假设 engine.py 已经更新了这两个函数)
+    # def run_draft_process_continuous_single_client(self): pass
+    # def run_target_process_single_client(self): pass
+
+    def preprocess(self, input_text):
+        dataset = getattr(self.args, "dataset", "").lower()
+        if dataset == "mt_bench":
+            turns = input_text.get("turns", [])
+            # 使用首轮问题作为生成前缀，并附带类别便于区分任务
+            prompt = turns[0].strip()
+            if input_text.get("category"):
+                prompt = f"[{input_text['category']}] {prompt}"
+            raw_task_id = input_text.get("task_id", input_text.get("question_id", 0))
+        elif dataset == "gsm8k":
+            prompt = input_text["prompt"].strip()
+            raw_task_id = input_text.get("task_id", input_text.get("question_id", 0))
+        else:
+            prompt = input_text['prompt'].strip()
+            raw_task_id = input_text['task_id']
+
+        try:
+            task_id = int(str(raw_task_id).split('/')[-1])
+        except Exception:
+            task_id = raw_task_id
+        return prompt, task_id
+
+    def postprocess(self, input_text, output_text):
+        bos_token = '<s>'
+        eos_token = '</s>'
+        if output_text.startswith(bos_token):
+            generation = output_text[len(input_text)+len(bos_token)+1:]
+        else:
+            generation = output_text[len(input_text):]
+
+        stop_words = ["\nclass", "\ndef", "\n#", "\n@", "\nprint", "\nif", "\n```", eos_token]
+        for stop_word in stop_words:
+            if stop_word in generation:
+                generation = generation[:generation.index(stop_word)].strip()
+
+        return input_text + "\n    " + generation.replace("\t", "    ")
+
+    def _append_bayes_record(self, path: Path, record: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            existing = json.load(path.open("r", encoding="utf-8"))
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
+            existing = []
+        existing.append(record)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+
+    def _run_latency_trial(self, thresh_single: float, thresh_multi: float, min_tokens: int):
+        latencies = []
+        samples_iter = itertools.cycle(self.samples)
+        self.args.verify_thresh_single = thresh_single
+        self.args.verify_thresh_multi = thresh_multi
+        while len(latencies) < min_tokens:
+            sample = next(samples_iter)
+            prompt, task_id = self.preprocess(sample)
+            self._reset_state()
+            self.edge_process_draft_model(prompt, task_id)
+            latencies.extend(self._token_durations)
+        return latencies
+
+    def bayes_optimize_thresholds(self):
+        if not self.samples:
+            self.color_print("[Main] 无样本可用于贝叶斯优化，直接退出。", 1)
+            return
+        tokens_target = getattr(self.args, "bayes_tokens_per_trial", 50)
+        log_path = Path(self.exp_name) / "bayes_trials.json"
+        search_space = [
+            Real(self.args.bayes_single_min, self.args.bayes_single_max, name="verify_thresh_single"),
+            Real(self.args.bayes_multi_min, self.args.bayes_multi_max, name="verify_thresh_multi"),
+        ]
+
+        def objective(params):
+            thresh_single, thresh_multi = params
+            latencies = self._run_latency_trial(thresh_single, thresh_multi, tokens_target)
+            if not latencies:
+                return float("inf")
+            avg_latency = float(sum(latencies) / len(latencies))
+            record = {
+                "thresh_single": thresh_single,
+                "thresh_multi": thresh_multi,
+                "avg_token_time": avg_latency,
+                "num_tokens": len(latencies),
+                "latencies": latencies,
+            }
+            self._append_bayes_record(log_path, record)
+            self.color_print(
+                f"[Bayes] st={thresh_single:.4f}, mt={thresh_multi:.4f}, tokens={len(latencies)}, avg={avg_latency:.6f}",
+                3,
+            )
+            return avg_latency
+
+        result = gp_minimize(
+            func=objective,
+            dimensions=search_space,
+            n_calls=getattr(self.args, "bayes_calls", 15),
+            n_initial_points=getattr(self.args, "bayes_init_points", 5),
+            random_state=self.seed,
+        )
+        best_single, best_multi = result.x
+        best_record = {
+            "best_thresh_single": best_single,
+            "best_thresh_multi": best_multi,
+            "best_avg_token_time": float(result.fun),
+        }
+        self._append_bayes_record(log_path, {"best": best_record})
+        self.color_print(
+            f"[Bayes] 最优阈值: st={best_single:.4f}, mt={best_multi:.4f}, avg={result.fun:.6f}",
+            2,
+        )
+
+    @torch.no_grad()
+    def eval(self):
+        if getattr(self.args, "bayes_optimize", False):
+            if self.verify_strategy != "hybrid":
+                self.color_print("[Main] 当前策略非 hybrid，将自动切换为 hybrid 进行阈值搜索。", 3)
+                self.verify_strategy = "hybrid"
+            self.bayes_optimize_thresholds()
+            return
+        # start_time = time.time()
+        seed_everything(self.args.seed)
+        for i in range(1):
+            for sample in self.samples:
+                prompt, task_id = self.preprocess(sample)
+                self._reset_state()
+                bandwidth_label = f"{self.bandwidth_MBps:g}"
+                # bandwidth_label = "{0}"
+                path = os.path.join(self.exp_name, f"gamma_{self.gamma}_bw={bandwidth_label}MB.json")
+                if 'pid' in self.exp_name:
+                    path = os.path.join(
+                        self.exp_name,
+                        f"vs=pid_tau={getattr(self.args, 'pid_init_tau', self.pid_tau):g}_target={getattr(self.args, 'pid_target_accept', self.pid_target_accept):g}_bw={bandwidth_label}MB.json",
+                    )
+                elif 'edgeLLM' in self.exp_name:
+                    path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}_bw={bandwidth_label}MB.json")
+                elif 'single' in self.exp_name or 'hsl' in self.exp_name:
+                    path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+                elif 'diff' in self.exp_name:
+                    path = os.path.join(self.exp_name, f"diff={self.verify_thresh_diff}_bw={bandwidth_label}MB.json")
+                elif 'entropy' in self.exp_name:
+                    path = os.path.join(self.exp_name, f"entropy={self.entropy_thresh}_bw={bandwidth_label}MB.json")
+                elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
+                    if self.args.ablation_study:
+                        if self.args.verify_strategy == 'single-token':
+                            path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+                        elif self.args.verify_strategy == 'multiple-tokens':
+                            path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}_bw={bandwidth_label}MB.json")
+                        elif self.args.verify_strategy == 'fixed-num':
+                            path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}_bw={bandwidth_label}MB.json")
+                        else:
+                            path = os.path.join(self.exp_name, f"ab_nomerge_bw={bandwidth_label}MB.json")
+                    else:
+                        if self.args.bayes_optimize:
+                            path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}_bw={bandwidth_label}MB.json")
+                        else:
+                            path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}_bw={bandwidth_label}MB.json")
+
+                if os.path.exists(path):
+                    print('path exists:', path)
+                    with open(path, 'r', encoding='utf-8') as f:
+                        try:
+                            data = json.load(f)
+                        except json.JSONDecodeError:
+                            data = []
+                    if any(entry['task_id'] == task_id for entry in data):
+                        self.color_print(f"[Main] Task {task_id} already evaluated. Skipping.", 3)
+                        continue
+                    
+                
+                self.edge_process_draft_model(prompt, task_id)
+                # time.sleep(10)  # 确保草稿进程有时间处理请求
+        # end_time = time.time()
+        # print(f'花费：{end_time-start_time}')
+        
+
+if __name__ == "__main__":
+    MAX_RETRY = 5
+    for i in range(MAX_RETRY):
+        try:
+            args = parse_arguments()
+            evaluator = CloudEdgeSpeculativeEval(args)
+            evaluator.eval()
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error: {e}")
+            if i == MAX_RETRY - 1:
+                raise
+            time.sleep(2)

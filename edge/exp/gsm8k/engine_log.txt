@@ -1,0 +1,1 @@
+{"dataset": "gsm8k", "algorithm": "hsl", "bandwidth_MBps": 2.5, "C": 0.025, "gamma": 6, "verify_strategy": "single-token", "verify_thresh_single": 0.7, "verify_thresh_multi": 0.9, "event": "verify_failed", "task_id": 8, "response": {"error": 502}}
