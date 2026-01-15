@@ -60,14 +60,14 @@ class Decoding(ABC):
         self._token_time_ref: float = 0.0
         self._token_durations: List[float] = []
         # self.exp_name = strategy2exp(self.verify_strategy)
-        self.exp_name = os.path.join(os.getcwd(), "exp_bw1", self.args.dataset, self.algorithm)
+        self.exp_name = os.path.join(os.getcwd(), "exp_iot_gsm", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
         if self.algorithm == "vanilla" or self.algorithm == "vanilla-with-merge-no-send" or self.algorithm == "hsl":
             self.send_while_generating = False
         else:
             self.send_while_generating = True
-        self.log_path = os.path.join(os.getcwd(), "exp_mobilephone", self.args.dataset, "engine_log.txt")
+        self.log_path = os.path.join(os.getcwd(), "exp_iot_gsm", self.args.dataset, "engine_log.txt")
         self.info = {
             "dataset": self.args.dataset,
             "algorithm": self.algorithm,
@@ -308,7 +308,7 @@ class Decoding(ABC):
 
         if ('merge' in self.algorithm or 'pipesd' in self.algorithm) and not self.args.nomerge:
             batches, _ = dynamic_token_scheduling_dp(
-                [self.args.default_token_compute] * (self.gamma * 4), self.C,
+                [self.args.default_token_compute] * (self.gamma), self.C,
                 (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0
             )
             merge_plan_batches = [len(batch) for batch in batches if batch]

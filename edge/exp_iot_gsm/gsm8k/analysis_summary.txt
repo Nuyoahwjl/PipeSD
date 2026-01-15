@@ -1,0 +1,17 @@
+
+Directory: edgeLLM
+Averages by strategy:
+multiple-tokens st=0.94 mt=1.41 avg_tpt=0.2309s avg_total=27.670s avg_verifications=48.8 gpu_energy=118.13J gpu_power_int=98.41J task_energy=125.71J (n=10, all) file=edgeLLM_alpha=0.5_mult=0.7_bw=2.5MB.json
+
+Directory: hsl
+Averages by strategy:
+single-token    st=0.70 mt=0.90 avg_tpt=0.2961s avg_total=66.421s avg_verifications=42.8 gpu_energy=114.74J gpu_power_int=99.13J task_energy=116.92J (n=10, all) file=st=0.7_bw=2.5MB.json
+
+Directory: pipesd
+Averages by strategy:
+hybrid          st=0.80 mt=0.50 avg_tpt=0.1904s avg_total=22.278s avg_verifications=43.9 gpu_energy=103.34J gpu_power_int=89.94J task_energy=113.96J (n=10, all) file=st=0.8_mt=0.5_bw=2.5MB.json
+
+Directory: vanilla
+Averages by strategy:
+fixed-num       st=0.94 mt=0.90 avg_tpt=0.4342s avg_total=56.297s avg_verifications=33.6 gpu_energy=88.32J gpu_power_int=87.65J task_energy=107.92J (n=10, all) file=gamma_6_bw=2.5MB.json
+No top-level results to plot.

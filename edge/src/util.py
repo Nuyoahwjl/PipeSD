@@ -70,10 +70,10 @@ def parse_arguments():
     """Specified arguments for running scripts."""
     parser = argparse.ArgumentParser(description='args for this file')
 
-    parser.add_argument('--dataset', type=str, default="humaneval")
+    # parser.add_argument('--dataset', type=str, default="humaneval")
     # parser.add_argument('--data_path', type=str, default="data/humaneval.jsonl")
     # parser.add_argument('--dataset', type=str, default="mt_bench")
-    # parser.add_argument('--dataset', type=str, default="gsm8k")
+    parser.add_argument('--dataset', type=str, default="gsm8k")
     # parser.add_argument('--data_path', type=str, default="data/mt_bench.jsonl")
 
     # gsm8k data path
@@ -144,7 +144,7 @@ def parse_arguments():
     parser.add_argument('--baseline_test', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--edgeLLM', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--merge_plan_interval', type=int, default=100, help='Number of generated tokens between merge plan recomputations.')
-    parser.add_argument('--default_token_compute', type=float, default=0.036, help='Default single-token compute time used for planning.')
+    parser.add_argument('--default_token_compute', type=float, default=0.144, help='Default single-token compute time used for planning.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
     # parser.add_argument('--send_while_generating', action='store_true', help='Enable sending tokens while generating to overlap communication and computation.')
     parser.add_argument('--algorithm', type=str, default="vanilla", choices=["vanilla", "vanilla-with-send", 'vanilla-with-merge', 'vanilla-with-merge-no-send', 'edgeLLM', 'hsl', 'pipesd'], help='Description of some other argument.')
