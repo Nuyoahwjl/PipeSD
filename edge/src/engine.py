@@ -6,7 +6,7 @@ import warnings
 transformers.utils.logging.set_verbosity(40)
 warnings.filterwarnings("ignore")
 from abc import ABC, abstractmethod
-from .util import seed_everything, norm_logits, sample, max_fn, softmax, strategy2exp
+from .util import seed_everything, softmax, strategy2exp
 from .merge import dynamic_token_scheduling_dp
 import time
 import numpy as np
@@ -15,7 +15,7 @@ import msgpack
 from .comm import BandwidthSender
 # For GGUF model support
 try:
-    from llama_cpp import Llama, llama_cpp
+    from llama_cpp import Llama
     GGUF_SUPPORT = True
 except ImportError:
     GGUF_SUPPORT = False
@@ -36,7 +36,6 @@ class Decoding(ABC):
         
         seed_everything(self.args.seed)
         self.seed = self.args.seed
-        self.seed_set = set()   
 
         self.draft_model = None
 
@@ -45,11 +44,9 @@ class Decoding(ABC):
         self.top_k: int = getattr(args, 'top_k', 40)
         self.top_p: float = getattr(args, 'top_p', 0.95)
         self.temp: float = getattr(args, 'temp', 0)
-        self.excluded_num: int = getattr(args, 'excluded_num', 100)
         self.C: float = getattr(args, 'C', 0.05)
         self.verify_strategy: str = getattr(args, 'verify_strategy', "fixed-num")
         self.verify_num: int = getattr(args, 'gamma', 8)
-        self.entropy_thresh: float = getattr(args, 'entropy_thresh', 0.05)
         self.accumulated_probs: float = 0.0
         self.bandwidth_MBps: float = getattr(args, 'bandwidth_MBps', 2) 
         
@@ -60,57 +57,26 @@ class Decoding(ABC):
         self._token_time_ref: float = 0.0
         self._token_durations: List[float] = []
         # self.exp_name = strategy2exp(self.verify_strategy)
-        self.exp_name = os.path.join(os.getcwd(), "exp_iot_gsm", self.args.dataset, self.algorithm)
+        self.exp_name = os.path.join(os.getcwd(), 'exp', "exp_iot_gsm", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
         if self.algorithm == "vanilla" or self.algorithm == "vanilla-with-merge-no-send" or self.algorithm == "hsl":
             self.send_while_generating = False
         else:
             self.send_while_generating = True
-        self.log_path = os.path.join(os.getcwd(), "exp_iot_gsm", self.args.dataset, "engine_log.txt")
-        self.info = {
-            "dataset": self.args.dataset,
-            "algorithm": self.algorithm,
-            "bandwidth_MBps": self.bandwidth_MBps,
-            "C": self.C,
-            "gamma": self.gamma,
-            "verify_strategy": self.verify_strategy,
-            "verify_thresh_single": getattr(self.args, "verify_thresh_single", None),
-            "verify_thresh_multi": getattr(self.args, "verify_thresh_multi", None),
-        }
         
 
     def _reset_state(self):
         # record metrics for report
-        self.draft_forward_times = 0
-        self.target_forward_times = 0
-        self.num_acc_tokens = []
         self.verify_spec_lengths = []
         self.verify_accept_lengths = []
         self.verify_his = []
         self.acc_ratio = 0.0
-        self.pid_tau_history = []
-        self.pid_accept_history = []
-        self.pid_error_history = []
-        self.pid_integral = 0.0
-        self.pid_prev_error = 0.0
         self.num_spec_tokens_sent = 0
         self.num_spec_tokens_generated = 0
-        self._spec_token_indices_sent = set()  # tokens已进入验证的唯一索引
-        self._spec_token_indices_generated = []  # 生成序列的索引
 
         self.verify_thresh_single = self.args.verify_thresh_single
         self.verify_thresh_multi = self.args.verify_thresh_multi
-        self.verify_thresh_diff = self.args.verify_thresh_diff
-        self.pid_tau = getattr(self.args, "pid_init_tau", 0.1)
-        self.pid_target_accept = getattr(self.args, "pid_target_accept", 0.85)
-        self.pid_kp = getattr(self.args, "pid_kp", 0.1)
-        self.pid_ki = getattr(self.args, "pid_ki", 0.01)
-        self.pid_kd = getattr(self.args, "pid_kd", 0.02)
-        self.pid_tau_min = getattr(self.args, "pid_tau_min", 0.01)
-        self.pid_tau_max = getattr(self.args, "pid_tau_max", 0.5)
-        self._token_time_ref = 0.0
-        self._token_durations = []
 
         self.alpha: float = getattr(self.args, 'init_alpha', 0.01)
 
@@ -139,49 +105,6 @@ class Decoding(ABC):
         arr = np.array(values, dtype=np.float32)
         quantiles = np.quantile(arr, probs)
         return {f"p{int(p * 100)}": float(q) for p, q in zip(probs, quantiles)}
-
-    def _record_token_time(self, num_tokens: int) -> None:
-        """
-        Track per-token latency using the elapsed wall time since the previous record.
-        If multiple tokens are accepted at once, split the elapsed time evenly.
-        """
-        if num_tokens <= 0:
-            return
-        now = time.time()
-        if self._token_time_ref == 0.0:
-            self._token_time_ref = now
-            return
-        elapsed = now - self._token_time_ref
-        per_token = elapsed / num_tokens
-        self._token_durations.extend([per_token] * num_tokens)
-        self._token_time_ref = now
-
-    def _pid_update_tau(self, observed_accept: float) -> float:
-        """
-        Update PID threshold based on observed acceptance rate.
-        """
-        error = self.pid_target_accept - observed_accept
-        self.pid_integral += error
-        derivative = error - self.pid_prev_error
-        delta_tau = self.pid_kp * error + self.pid_ki * self.pid_integral + self.pid_kd * derivative
-        self.pid_tau += delta_tau
-        self.pid_tau = max(self.pid_tau_min, min(self.pid_tau_max, self.pid_tau))
-        self.pid_prev_error = error
-        self.pid_tau_history.append(self.pid_tau)
-        self.pid_accept_history.append(observed_accept)
-        self.pid_error_history.append(error)
-        return self.pid_tau
-    
-    def _entropy_topk(self, probs: np.ndarray, k: int = 10) -> float:
-        if probs.size == 0:
-            return 0.0
-        k = min(k, probs.size)
-        top = np.partition(probs, -k)[-k:]
-        top = top[top > 0]
-        if top.size == 0:
-            return 0.0
-        normalized = top / np.sum(top)
-        return float(-np.sum(normalized * np.log(normalized + 1e-12)))
     
     def if_verify(self, probs_draft, verify_mode):
         """
@@ -258,6 +181,31 @@ class Decoding(ABC):
                 self.alpha /= 0.5
             self.alpha = min(1.99, self.alpha)
     
+    def exp2path(self, bandwidth_label: str):
+        if 'edgeLLM' in self.exp_name:
+            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}_bw={bandwidth_label}MB.json")
+        elif 'single' in self.exp_name or 'hsl' in self.exp_name:
+            saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+        elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
+            if self.args.ablation_study:
+                if self.args.verify_strategy == 'single-token':
+                    saved_path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+                elif self.args.verify_strategy == 'multiple-tokens':
+                    saved_path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}_bw={bandwidth_label}MB.json")
+                elif self.args.verify_strategy == 'fixed-num':
+                    saved_path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}_bw={bandwidth_label}MB.json")
+                else:
+                    saved_path = os.path.join(self.exp_name, f"ab_nomerge_bw={bandwidth_label}MB.json")
+            else:
+                if self.args.bayes_optimize:
+                    saved_path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}_bw={bandwidth_label}MB.json")
+                else:
+                    saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}_bw={bandwidth_label}MB.json")
+        else:
+            saved_path = os.path.join(self.exp_name, f"gamma_{self.gamma}_bw={bandwidth_label}MB.json")
+
+        return saved_path
+    
     def edge_process_draft_model(self, prefix, task_id):
         """
         [最终修正 & 多任务版] 边缘端工作进程。
@@ -289,7 +237,6 @@ class Decoding(ABC):
         res = init_future.result()
         if res is None or 'error' in res:
             print("[Edge] 初始化请求失败，退出进程。")
-            self.append_log(self.log_path, {**self.info, "event": "init_failed", "task_id": task_id, "response": res})
             return
         print(res)
 
@@ -312,21 +259,16 @@ class Decoding(ABC):
                 (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0
             )
             merge_plan_batches = [len(batch) for batch in batches if batch]
-            # merge_plan_batches = [7, 10]
             print(f"[Edge] 计算得到合并计划: {merge_plan_batches}")
-            # print(f'[EDGE] compute_times: {self.args.default_token_compute}, C: {self.C}, d: {(self.args.token_size_MB / self.bandwidth_MBps)}')
         else:
             merge_plan_batches = [self.gamma * 4]
 
-        # merge_plan_batches = [1] * 30
         merge_plan_index = 0
         
         total_start_time = time.time()
-        self._token_time_ref = total_start_time
         while len(output_tokens) < self.max_len:
             
             # --- 1. 生成一个token ---
-            # if not (should_end or should_verify or should_send or should_verify_waiting):
             next_token = self.draft_model.sample(top_k=self.top_k, top_p=self.top_p, temp=self.temp)
             current_probs = softmax(self.draft_model.scores[self.draft_model.n_tokens-1])
             self.num_spec_tokens_generated += 1
@@ -384,14 +326,10 @@ class Decoding(ABC):
                 self._spec_token_indices_sent.update(new_indices)
                 self.num_spec_tokens_sent += len(new_indices)
 
-                print(f"[DEBUG] 发送验证请求，tokens: {current_batch_tokens}, n_past: {current_n_past}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
-                # print(f'[DEBUG] 采样结果: {[np.argmax(x) for x in total_speculative_probs]}')
+                # print(f"[DEBUG] 发送验证请求，tokens: {current_batch_tokens}, n_past: {current_n_past}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
 
-                st = time.time()
                 future = self.sender.submit(PROPOSE_ENDPOINT, payload_bytes, headers={"Content-Type": "application/msgpack"})
                 verify_result = None
-                et = time.time()
-                # print(f"[DEBUG] 验证请求耗时: {et - st:.4f} 秒, tokens: {current_batch_tokens}")
                 
                 # --- 3. 在等待验证结果期间继续生成token ---
                 waiting_tokens = []  # 等待期间生成的token
@@ -406,9 +344,6 @@ class Decoding(ABC):
                 waiting_verify_future = None
                 
                 while self.send_while_generating and len(output_tokens) + len(total_speculative_tokens) + len(waiting_tokens) < self.max_len:
-                    # if not self.args.baseline_test:
-                    #     break
-                    # 继续生成token
 
                     if not waiting_tokens:
                         speculated_final_token = self.draft_model.sample(top_k=self.top_k, top_p=self.top_p, temp=self.temp)
@@ -440,7 +375,6 @@ class Decoding(ABC):
                         verify_result = future.result()
                         if 'error' in verify_result or 'n_accepted' not in verify_result or 'final_token' not in verify_result:
                             print(f"[Edge] 服务器返回错误: {verify_result}")
-                            self.append_log(self.log_path, {**self.info, "event": "verify_failed", "task_id": task_id, "response": verify_result})
                             return
                         n_accepted = verify_result['n_accepted']
                         final_token = verify_result['final_token']
@@ -473,19 +407,17 @@ class Decoding(ABC):
                     waiting_futures.append(waiting_future)
                     if should_verify_waiting:
                         waiting_verify_future = waiting_future
-                    print(f"[DEBUG] 发送等待期间的批次请求，tokens: {wait_token}, n_past: {current_n_past + len(total_speculative_tokens) + 1}， tokens: {self.draft_model.detokenize(waiting_tokens).decode('utf-8', 'ignore')}, should_verify: {should_verify_waiting}")
+                    # print(f"[DEBUG] 发送等待期间的批次请求，tokens: {wait_token}, n_past: {current_n_past + len(total_speculative_tokens) + 1}， tokens: {self.draft_model.detokenize(waiting_tokens).decode('utf-8', 'ignore')}, should_verify: {should_verify_waiting}")
 
                     if should_verify_waiting or wait_token == self.draft_model.token_eos():
                         break
                 
-                # print(f"[DEBUG] 验证结果: {verify_result}")
                 if verify_result is None:
                     verify_result = future.result()
                 
                 # 检查响应是否包含错误信息
                 if 'error' in verify_result or 'n_accepted' not in verify_result:
                     print(f"[Edge] 服务器返回错误: {verify_result}")
-                    self.append_log(self.log_path, {**self.info, "event": "verify_failed", "task_id": task_id, "response": verify_result})
                     return
 
                 # 处理验证结果
@@ -493,7 +425,6 @@ class Decoding(ABC):
                 final_token = verify_result['final_token']
                 self.verify_spec_lengths.append(len(total_speculative_tokens))
                 self.verify_accept_lengths.append(n_accepted)
-                self.verify_his.append((len(total_speculative_tokens), n_accepted))
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
@@ -502,33 +433,30 @@ class Decoding(ABC):
                 output_tokens.append(final_token)
                 self._record_token_time(len(accepted_tokens) + 1)
                 
-                # 更新模型状态 - n_past = 验证前的n_past + 接受的token数量 + 1（final_token）
-                
                 last_verify_all_passed = (n_accepted == len(total_speculative_tokens) and final_token == speculated_final_token)
                 if not last_verify_all_passed:
                     self.draft_model.n_tokens = current_n_past + n_accepted
-                print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted: {n_accepted}')
+                # print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted: {n_accepted}')
                 current_n_past = current_n_past + n_accepted + 1
                 if final_token != speculated_final_token:
                     self.draft_model.eval([final_token])
                     print(f"[DEBUG] final_token 与 speculated_final_token 不同，eval final_token: {final_token}")
                 
-                print(f"[DEBUG] 更新状态: n_past {current_n_past - n_accepted - 1} -> {current_n_past}, accepted {n_accepted}, final_token {final_token}")
-                # print(f"[DEBUG] 本轮验证: {self.draft_model.detokenize(output_tokens[135:]).decode('utf-8', 'ignore')}")
+                # print(f"[DEBUG] 更新状态: n_past {current_n_past - n_accepted - 1} -> {current_n_past}, accepted {n_accepted}, final_token {final_token}")
                 
-                if self.verify_strategy == 'multiple-tokens' or self.verify_strategy == 'hybrid':
+                if self.verify_strategy == 'multiple-tokens':
                     # 更新多项式阈值
                     self.update_thresh(multiply_times=self.multiply_times, n_accepted=n_accepted, n_all=len(total_speculative_tokens))
-                    print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
+                    # print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
                 
                 verify_result = None  # 重置验证结果
                 
                 
                 # --- 5. 处理等待期间生成的token ---
-                print(f"[DEBUG] 验证期间生成了 {len(waiting_tokens)} 个token，n_accepted={n_accepted}")
+                # print(f"[DEBUG] 验证期间生成了 {len(waiting_tokens)} 个token，n_accepted={n_accepted}")
                 waiting_batch_future = None
                 if waiting_tokens:
-                    print(f"[DEBUG] final_token: {final_token}, speculated_final_token: {speculated_final_token}, n_accepted: {n_accepted}, total_speculative_tokens: {len(total_speculative_tokens)}")
+                    # print(f"[DEBUG] final_token: {final_token}, speculated_final_token: {speculated_final_token}, n_accepted: {n_accepted}, total_speculative_tokens: {len(total_speculative_tokens)}")
                     # 仅重打包那些尚未出队发送的等待请求：排除已完成/已取消/已 in-flight 的 future
                     pending_indices = []
                     for idx, fut in enumerate(waiting_futures):
@@ -549,8 +477,8 @@ class Decoding(ABC):
                                     if not fut.done():
                                         self.sender.cancel_future(fut)
                                 drained_requests = self.sender.drain_tag(waiting_tag)
-                                if drained_requests:
-                                    print(f"[DEBUG] 取消等待期间挂起的 {len(drained_requests)} 个请求以重新打包")
+                                # if drained_requests:
+                                    # print(f"[DEBUG] 取消等待期间挂起的 {len(drained_requests)} 个请求以重新打包")
                                 waiting_batch_tokens = [waiting_tokens[idx] for idx in pending_indices]
                                 waiting_batch_probs = [waiting_probs[idx] for idx in pending_indices]
                                 waiting_batch_payload = {
@@ -577,7 +505,7 @@ class Decoding(ABC):
                                 waiting_futures.append(waiting_batch_future)
                             else:
                                 waiting_batch_future = waiting_verify_future
-                                print("[DEBUG] 等待请求已全部完成，跳过重新打包")
+                                # print("[DEBUG] 等待请求已全部完成，跳过重新打包")
                         else:
                             total_speculative_tokens = waiting_tokens
                             total_speculative_probs = waiting_probs
@@ -585,14 +513,14 @@ class Decoding(ABC):
                             current_batch_tokens = []
                             current_batch_probs = []
                             current_batch_indices = []
-                            print(f"[DEBUG] 全部接受，使用等待期间的 {len(waiting_tokens)} 个token作为新推测")
+                            # print(f"[DEBUG] 全部接受，使用等待期间的 {len(waiting_tokens)} 个token作为新推测")
                     else:
                         for fut in waiting_futures:
                             if not fut.done():
                                 self.sender.cancel_future(fut)
                         drained_requests = self.sender.drain_tag(waiting_tag)
-                        if drained_requests:
-                            print(f"[DEBUG] 验证未通过，取消等待期间的 {len(drained_requests)} 个挂起请求")
+                        # if drained_requests:
+                        #     print(f"[DEBUG] 验证未通过，取消等待期间的 {len(drained_requests)} 个挂起请求")
 
                     if waiting_batch_future is not None and should_verify_waiting:
                         verify_result_waiting = waiting_batch_future.result()
@@ -613,14 +541,14 @@ class Decoding(ABC):
                         output_tokens.append(final_token_waiting)
                         self._record_token_time(len(accepted_waiting_tokens) + 1)
                         self.draft_model.n_tokens = current_n_past + n_accepted_waiting
-                        print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted_waiting: {n_accepted_waiting}')
+                        # print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted_waiting: {n_accepted_waiting}')
                         self.draft_model.eval([final_token_waiting])
                         current_n_past = self.draft_model.n_tokens
-                        print(f"[DEBUG] 重构批次全部接受，更新状态: n_past {current_n_past - n_accepted_waiting - 1} -> {current_n_past}, final_token {final_token_waiting}")
-                        if self.verify_strategy == 'multiple-tokens' or self.verify_strategy == 'hybrid':
+                        # print(f"[DEBUG] 重构批次全部接受，更新状态: n_past {current_n_past - n_accepted_waiting - 1} -> {current_n_past}, final_token {final_token_waiting}")
+                        if self.verify_strategy == 'multiple-tokens':
                             # 更新多项式阈值
                             self.update_thresh(multiply_times=self.multiply_times, n_accepted=n_accepted_waiting, n_all=len(waiting_tokens))
-                            print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
+                            # print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
 
                 if not (last_verify_all_passed and not should_verify_waiting and waiting_tokens):
                     total_speculative_tokens = []
@@ -649,16 +577,10 @@ class Decoding(ABC):
                 }
                 payload_bytes = msgpack.packb(payload)
 
-                print(f"[DEBUG] 发送批次请求，tokens: {current_batch_tokens}, n_past: {current_n_past}, index: {len(total_speculative_tokens)}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
-                print(f"[发送] 当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}")
+                # print(f"[DEBUG] 发送批次请求，tokens: {current_batch_tokens}, n_past: {current_n_past}, index: {len(total_speculative_tokens)}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
+                # print(f"[发送] 当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}")
 
-                # 发送当前批次（非验证）
-                st1 = time.time()
                 future = self.sender.submit(PROPOSE_ENDPOINT, payload_bytes, headers={"Content-Type": "application/msgpack"})
-
-                # await result_future
-                et1 = time.time()
-                # print(f"[DEBUG] 发送批次请求耗时: {et1 - st1:.4f} 秒, tokens: {current_batch_tokens}")
 
                 # 重置当前批次
                 current_batch_tokens = []
@@ -675,19 +597,10 @@ class Decoding(ABC):
         # self.color_print(f"[Edge] 任务 {task_id} 生成完成, 前缀长度{prefix_len}，输出长度 {len(output_tokens) - prefix_len}，结果:\n{post_result}", 2)
         verify_stats = {
             'num_verifications': len(self.verify_spec_lengths),
-            'spec_len_hist': self._build_histogram(self.verify_spec_lengths),
-            'accepted_len_hist': self._build_histogram(self.verify_accept_lengths),
-            'spec_len_quantiles': self._build_quantiles(self.verify_spec_lengths),
-            'accepted_len_quantiles': self._build_quantiles(self.verify_accept_lengths),
             'num_spec_tokens_sent': self.num_spec_tokens_sent,
             'num_spec_tokens_generated': self.num_spec_tokens_generated,
             'num_spec_tokens': self.num_spec_tokens_sent,
         }
-        if self.verify_strategy == 'pid':
-            verify_stats['pid_tau_history'] = self.pid_tau_history
-            verify_stats['pid_accept_history'] = self.pid_accept_history
-            verify_stats['pid_error_history'] = self.pid_error_history
-            verify_stats['pid_final_tau'] = self.pid_tau
 
         exit_payload = msgpack.packb({'type': 'exit', 'task_id': task_id})
         exit_result = self.sender.submit(
@@ -698,40 +611,9 @@ class Decoding(ABC):
 
         bandwidth_label = f"{self.bandwidth_MBps:g}"
         # bandwidth_label = "0"
-        saved_path = os.path.join(self.exp_name, f"gamma_{self.gamma}_bw={bandwidth_label}MB.json")
-        print(saved_path)
-        if 'pid' in self.exp_name:
-            saved_path = os.path.join(
-                self.exp_name,
-                f"vs=pid_tau={getattr(self.args, 'pid_init_tau', self.pid_tau):g}_target={getattr(self.args, 'pid_target_accept', self.pid_target_accept):g}_bw={bandwidth_label}MB.json",
-            )
-        elif 'edgeLLM' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}_bw={bandwidth_label}MB.json")
-        elif 'single' in self.exp_name or 'hsl' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
-        elif 'diff' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"diff={self.verify_thresh_diff}_bw={bandwidth_label}MB.json")
-        elif 'entropy' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"entropy={self.entropy_thresh}_bw={bandwidth_label}MB.json")
-        elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
-            if self.args.ablation_study:
-                if self.args.verify_strategy == 'single-token':
-                    saved_path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
-                elif self.args.verify_strategy == 'multiple-tokens':
-                    saved_path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}_bw={bandwidth_label}MB.json")
-                elif self.args.verify_strategy == 'fixed-num':
-                    saved_path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}_bw={bandwidth_label}MB.json")
-                else:
-                    saved_path = os.path.join(self.exp_name, f"ab_nomerge_bw={bandwidth_label}MB.json")
-            else:
-                if self.args.bayes_optimize:
-                    saved_path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}_bw={bandwidth_label}MB.json")
-                else:
-                    saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}_bw={bandwidth_label}MB.json")
+        saved_path = self.exp2path(bandwidth_label)        
+
         os.makedirs(self.exp_name, exist_ok=True) 
-        # if task_id == 0:
-        #     with open(saved_path, "w", encoding="utf-8") as f:
-        #         f.write("")  # 清空文件
         avg_token_time = float(sum(self._token_durations) / len(self._token_durations)) if self._token_durations else None
         exp_result = {
             'task_id': task_id,
@@ -755,8 +637,6 @@ class Decoding(ABC):
             'acc_ratio': self.acc_ratio / len(self.verify_spec_lengths) if self.verify_spec_lengths else 0.0,
             'verify_his': self.verify_his,
         }
-        if self.verify_strategy == 'entropy':
-            exp_result['entropy_thresh'] = self.entropy_thresh
         # 读取已有数据
         if os.path.exists(saved_path):
             with open(saved_path, 'r', encoding='utf-8') as f:
@@ -774,25 +654,8 @@ class Decoding(ABC):
         with open(saved_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
 
-        saved_path_probs = os.path.join(self.exp_name, f"max_probs.json")
-        with open(saved_path_probs, 'w', encoding='utf-8') as f:
-            json.dump(max_probs, f, ensure_ascii=False, indent=4)
-
-        # saved_path_spec = os.path.join(self.exp_name, f"spec_results.json")
-        # out = {'out': output_tokens}
-        # with open(saved_path_spec, 'w', encoding='utf-8') as f:
-        #     json.dump(out, f, ensure_ascii=False, indent=4)
-
         self.sender.close()
 
         return post_result, spent_time
-    
-    def append_log(self, path: str, message: dict):
-        """
-        将日志消息追加到日志文件中。
-        """
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(message, ensure_ascii=False) + '\n')
 
         

@@ -7,21 +7,13 @@ import time
 import json
 import itertools
 from pathlib import Path
-from tqdm import tqdm
-from multiprocessing import Queue, Process
+from multiprocessing import Queue
 
 from src.util import seed_everything, parse_arguments
 from src.engine import Decoding
 import torch.multiprocessing as mp
 from skopt import gp_minimize
 from skopt.space import Real
-
-try:
-    from llama_cpp import Llama, llama_cpp
-    GGUF_SUPPORT = True
-except ImportError:
-    GGUF_SUPPORT = False
-    print("Warning: llama-cpp-python not found. GGUF model support disabled.")
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
@@ -45,9 +37,8 @@ class CloudEdgeSpeculativeEval(Decoding):
                 raw_samples = [json.loads(line) for line in f]
 
             dataset = getattr(self.args, "dataset", "").lower()
-            if dataset == "mt_bench":
-                samples = self._load_mt_bench_samples(raw_samples)
-            elif dataset == "humaneval":
+
+            if dataset == "humaneval":
                 samples = self._load_humaneval_samples(raw_samples)
             elif dataset == "gsm8k":
                 samples = self._load_gsm8k_samples(raw_samples)
@@ -73,23 +64,6 @@ class CloudEdgeSpeculativeEval(Decoding):
             samples.append({"prompt": prompt, "task_id": task_id})
         return samples
 
-    def _load_mt_bench_samples(self, raw_samples):
-        samples = []
-        for idx, item in enumerate(raw_samples):
-            turns = item.get("turns", [])
-            if not turns:
-                self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 turns 字段", 1)
-                continue
-            task_id = item.get("question_id", idx)
-            samples.append(
-                {
-                    "category": item.get("category", ""),
-                    "turns": turns,
-                    "task_id": task_id,
-                }
-            )
-        return samples
-
     def _load_gsm8k_samples(self, raw_samples):
         samples = []
         for idx, item in enumerate(raw_samples):
@@ -100,11 +74,6 @@ class CloudEdgeSpeculativeEval(Decoding):
             # GSM8K 不包含显式 id，这里按顺序分配 task_id
             samples.append({"prompt": question, "task_id": idx})
         return samples
-    
-    # 2. 在 Decoding 基类中添加新的进程函数签名
-    # (假设 engine.py 已经更新了这两个函数)
-    # def run_draft_process_continuous_single_client(self): pass
-    # def run_target_process_single_client(self): pass
 
     def preprocess(self, input_text):
         dataset = getattr(self.args, "dataset", "").lower()
@@ -234,35 +203,7 @@ class CloudEdgeSpeculativeEval(Decoding):
                 self._reset_state()
                 bandwidth_label = f"{self.bandwidth_MBps:g}"
                 # bandwidth_label = "{0}"
-                path = os.path.join(self.exp_name, f"gamma_{self.gamma}_bw={bandwidth_label}MB.json")
-                if 'pid' in self.exp_name:
-                    path = os.path.join(
-                        self.exp_name,
-                        f"vs=pid_tau={getattr(self.args, 'pid_init_tau', self.pid_tau):g}_target={getattr(self.args, 'pid_target_accept', self.pid_target_accept):g}_bw={bandwidth_label}MB.json",
-                    )
-                elif 'edgeLLM' in self.exp_name:
-                    path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}_bw={bandwidth_label}MB.json")
-                elif 'single' in self.exp_name or 'hsl' in self.exp_name:
-                    path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
-                elif 'diff' in self.exp_name:
-                    path = os.path.join(self.exp_name, f"diff={self.verify_thresh_diff}_bw={bandwidth_label}MB.json")
-                elif 'entropy' in self.exp_name:
-                    path = os.path.join(self.exp_name, f"entropy={self.entropy_thresh}_bw={bandwidth_label}MB.json")
-                elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
-                    if self.args.ablation_study:
-                        if self.args.verify_strategy == 'single-token':
-                            path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
-                        elif self.args.verify_strategy == 'multiple-tokens':
-                            path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}_bw={bandwidth_label}MB.json")
-                        elif self.args.verify_strategy == 'fixed-num':
-                            path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}_bw={bandwidth_label}MB.json")
-                        else:
-                            path = os.path.join(self.exp_name, f"ab_nomerge_bw={bandwidth_label}MB.json")
-                    else:
-                        if self.args.bayes_optimize:
-                            path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}_bw={bandwidth_label}MB.json")
-                        else:
-                            path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}_bw={bandwidth_label}MB.json")
+                path = self.exp2path(bandwidth_label)
 
                 if os.path.exists(path):
                     print('path exists:', path)
@@ -277,9 +218,6 @@ class CloudEdgeSpeculativeEval(Decoding):
                     
                 
                 self.edge_process_draft_model(prompt, task_id)
-                # time.sleep(10)  # 确保草稿进程有时间处理请求
-        # end_time = time.time()
-        # print(f'花费：{end_time-start_time}')
         
 
 if __name__ == "__main__":
