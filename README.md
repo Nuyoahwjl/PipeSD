@@ -1,20 +1,14 @@
 # PipeSD
 
-PipeSD is a Parallel Speculative Decoding framework that boosts LLM inference throughput while keeping generation lossless. This repository contains two independent subdirectories for different deployment scenarios.
+Speculative decoding demo with separate cloud and edge components.
 
-## Project Structure
-- `edge/`: primary research/experiment code (runtime, scripts, benchmarks, and experiment outputs).
-- `cloud/`: lightweight code and resources for cloud environments.
+## Layout
+- cloud: FastAPI service for verification and metrics
+- edge: client/runner for speculative decoding experiments
 
-## Quick Start (edge)
-```sh
-cd edge
-sh install.sh
-```
+## Quick start
+1) Install dependencies for your environment.
+2) Start the cloud service.
+3) Run the edge client against the service.
 
-Configure model and data paths in `edge/src/util.py`, then run:
-```sh
-sh scripts/run_para_sd.sh
-```
-
-For more details, see `edge/README.md`.
+See the per-folder READMEs for specifics.

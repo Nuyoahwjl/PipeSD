@@ -20,45 +20,45 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
     end=$END_INDEX
   fi
 
-  # cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
-  #   --algorithm pipesd
-  #   --verify_strategy multiple-tokens
-  #   --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
-  #   --init_alpha 0.95
-  #   --multiply_times 0.97
-  #   --start_index_of_sample "$start"
-  #   --end_index_of_sample "$end"
-  #   --ablation_study
-  # )
-  # echo "[run] pipesd init_alpha=0.95 multiply_times=0.97 samples=${start}-${end}"
-  # "${cmd[@]}"
-  # sleep 2
+  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+    --algorithm pipesd
+    --verify_strategy multiple-tokens
+    --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
+    --init_alpha 0.95
+    --multiply_times 0.97
+    --start_index_of_sample "$start"
+    --end_index_of_sample "$end"
+    --ablation_study
+  )
+  echo "[run] pipesd init_alpha=0.95 multiply_times=0.97 samples=${start}-${end}"
+  "${cmd[@]}"
+  sleep 2
 
-  # cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
-  #   --algorithm pipesd
-  #   --verify_strategy single-token
-  #   --verify_thresh_single 0.99
-  #   --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
-  #   --start_index_of_sample "$start"
-  #   --end_index_of_sample "$end"
-  #   --ablation_study
-  # )
-  # echo "[run] pipesd verify_thresh_single=0.99 samples=${start}-${end}"
-  # "${cmd[@]}"
-  # sleep 2
+  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+    --algorithm pipesd
+    --verify_strategy single-token
+    --verify_thresh_single 0.99
+    --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
+    --start_index_of_sample "$start"
+    --end_index_of_sample "$end"
+    --ablation_study
+  )
+  echo "[run] pipesd verify_thresh_single=0.99 samples=${start}-${end}"
+  "${cmd[@]}"
+  sleep 2
 
-  # cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
-  #   --algorithm pipesd
-  #   --verify_strategy fixed-num
-  #   --gamma 6
-  #   --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
-  #   --start_index_of_sample "$start"
-  #   --end_index_of_sample "$end"
-  #   --ablation_study
-  # )
-  # echo "[run] pipesd gamma=6 samples=${start}-${end}"
-  # "${cmd[@]}"
-  # sleep 2
+  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+    --algorithm pipesd
+    --verify_strategy fixed-num
+    --gamma 6
+    --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
+    --start_index_of_sample "$start"
+    --end_index_of_sample "$end"
+    --ablation_study
+  )
+  echo "[run] pipesd gamma=6 samples=${start}-${end}"
+  "${cmd[@]}"
+  sleep 2
 
   cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
     --algorithm pipesd
