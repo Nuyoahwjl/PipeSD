@@ -1,12 +1,7 @@
 # install packages
-pip3 install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
-# pip3 install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
-pip3 install transformers==4.55.4 tqdm ipdb accelerate numpy=1.26.3 shortuuid fschat fastchat scikit-optimize
+pip install transformers ipdb accelerate==1.7.0 numpy==1.26.3 shortuuid fschat fastchat fastapi uvicorn pydantic msgpack pynvml --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
-# get fastchat for mt-bench
-# git clone https://github.com/lm-sys/FastChat.git
-# mv FastChat/fastchat/ fastchat/
-# rm -rf FastChat
-
-# get ouroboros
-# git clone https://github.com/thunlp/Ouroboros.git
+sudo apt install -y aria2
+export HF_ENDPOINT=https://hf-mirror.com
+./hfd.sh TheBloke/deepseek-coder-1.3b-instruct-GGUF --include deepseek-coder-1.3b-instruct.Q4_K_M.gguf --tool aria2c -x 10  --local-dir pre_models
+./hfd.sh TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF --include tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --tool aria2c -x 10  --local-dir pre_models

@@ -20,7 +20,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
     end=$END_INDEX
   fi
 
-  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+  cmd=( "$PYTHON_BIN" app/run_edge.py
     --algorithm pipesd
     --verify_strategy multiple-tokens
     --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
@@ -34,7 +34,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
   "${cmd[@]}"
   sleep 2
 
-  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+  cmd=( "$PYTHON_BIN" app/run_edge.py
     --algorithm pipesd
     --verify_strategy single-token
     --verify_thresh_single 0.99
@@ -47,7 +47,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
   "${cmd[@]}"
   sleep 2
 
-  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+  cmd=( "$PYTHON_BIN" app/run_edge.py
     --algorithm pipesd
     --verify_strategy fixed-num
     --gamma 6
@@ -60,7 +60,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
   "${cmd[@]}"
   sleep 2
 
-  cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+  cmd=( "$PYTHON_BIN" app/run_edge.py
     --algorithm pipesd
     --bandwidth_MBps "${BANDWIDTHS_MBPS[0]}"
     --start_index_of_sample "$start"

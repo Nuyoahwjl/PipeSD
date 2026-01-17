@@ -35,7 +35,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
 
   for bw in "${BANDWIDTHS_MBPS[@]}"; do
 
-    cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+    cmd=( "$PYTHON_BIN" app/run_edge.py
           --algorithm vanilla
           --verify_strategy fixed-num
           --gamma 6
@@ -52,7 +52,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
 
     # # HSL: sweep single thresholds.
     for single_thresh in "${HSL_THRESHOLDS[@]}"; do
-      cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+      cmd=( "$PYTHON_BIN" app/run_edge.py
         --algorithm hsl
         --verify_strategy single-token
         --verify_thresh_single "$single_thresh"
@@ -69,7 +69,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
     # pipesd: hybrid thresholds (single x multi).
     for single_thresh in "${PIPESD_SINGLE_THRESHOLDS[@]}"; do
       for multi_thresh in "${PIPESD_MULTI_THRESHOLDS[@]}"; do
-        cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+        cmd=( "$PYTHON_BIN" app/run_edge.py
           --algorithm pipesd
           --verify_strategy hybrid
           --verify_thresh_single "$single_thresh"
@@ -87,7 +87,7 @@ for ((start=START_INDEX; start<=END_INDEX; start+=BATCH_SIZE)); do
 
     for init_alpha in "${INIT_ALPHA[@]}"; do
       for multiply_times in "${MULTIPLY_TIMES[@]}"; do
-        cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+        cmd=( "$PYTHON_BIN" app/run_edge.py
               --algorithm edgeLLM
               --init_alpha "$init_alpha"
               --multiply_times "$multiply_times"

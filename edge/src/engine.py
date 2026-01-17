@@ -60,7 +60,7 @@ class Decoding(ABC):
         self.exp_name = os.path.join(os.getcwd(), 'exp', "exp_iot_gsm", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
-        if self.algorithm == "vanilla" or self.algorithm == "vanilla-with-merge-no-send" or self.algorithm == "hsl":
+        if self.algorithm == "vanilla" or self.algorithm == "hsl":
             self.send_while_generating = False
         else:
             self.send_while_generating = True

@@ -10,24 +10,9 @@ def seed_everything(seed: int):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # For reproducibility prefer deterministic algorithms and disable
-    # the cuDNN auto-tuner which can introduce variability.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # If available, enable PyTorch's deterministic mode (may raise on unsupported ops)
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        # Older PyTorch versions may not have this API; ignore in that case
-        pass
 
 def model_zoo(args):
     vocab_size = {
-        "codellama-7b": 32000,
-        "codellama-34b": 32000,
-        "codellama-70b": 32000,
         "TinyLlama-1.1B-Chat-v1.0-GPTQ": 32000,
         "tinyllama-1.1b-chat-v1.0-gguf": 32000,
         "llama-2-70b": 32000,
@@ -43,10 +28,6 @@ def model_zoo(args):
     
     zoo = {
         "tinyllama-1.1b-chat-v1.0-gguf": "pre_models/tinyllama-1.1b-chat-v1.0-gguf/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "llama-2-7b": "pre_models/llama-2-7b-chat-gguf/llama-2-7b-chat.Q4_K_M.gguf",
-        "deepseek-6.7b": "pre_models/deepseek-coder-6.7B-instruct-GPTQ",
-        "deepseek-1.3b": "pre_models/deepseek-coder-1.3b-instruct-GPTQ",
-        "deepseek-coder-1.3b-base-GGUF": "/home/jianhongbai/gyq/FastSD/deepseek-coder-1.3b-base-GGUF",
         "deepseek-coder-1.3b-instruct-GGUF": "pre_models/deepseek-coder-1.3b-instruct-GGUF/deepseek-coder-1.3b-instruct.Q4_K_M.gguf",
     }
 
@@ -60,7 +41,6 @@ def parse_arguments():
 
     # parser.add_argument('--dataset', type=str, default="humaneval")
     parser.add_argument('--dataset', type=str, default="gsm8k")
-    
     parser.add_argument('--exp_name', '-e', type=str, default="exp_fixednum", help='folder name for storing results.')
     parser.add_argument('--seed', '-s', type=int, default=1234, help='set a random seed, which can makes the result reproducible')
     parser.add_argument('--max_generated_tokens', type=int, default=128, help='max token number generated.')
@@ -92,7 +72,7 @@ def parse_arguments():
     parser.add_argument('--default_token_compute', type=float, default=0.144, help='Default single-token compute time used for planning.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
     # parser.add_argument('--send_while_generating', action='store_true', help='Enable sending tokens while generating to overlap communication and computation.')
-    parser.add_argument('--algorithm', type=str, default="vanilla", choices=["vanilla", "vanilla-with-send", 'vanilla-with-merge', 'vanilla-with-merge-no-send', 'edgeLLM', 'hsl', 'pipesd'], help='Description of some other argument.')
+    parser.add_argument('--algorithm', type=str, default="vanilla", choices=["vanilla", 'edgeLLM', 'hsl', 'pipesd'], help='Different algorithm choices.')
     parser.add_argument('--start_index_of_sample', type=int, default=0, help='start index of samples to eval.')
     parser.add_argument('--end_index_of_sample', type=int, default=4, help='end index of samples to eval.')
     parser.add_argument('--ablation_study', action='store_true', help='whether to run ablation study.')

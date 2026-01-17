@@ -37,7 +37,7 @@ if (( ${#BW_LIST[@]} > 0 )); then
     fi
     bw="${BW_LIST[$i]}"
 
-    cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+    cmd=( "$PYTHON_BIN" app/run_edge.py
           --algorithm vanilla
           --verify_strategy fixed-num
           --gamma 6
@@ -52,7 +52,7 @@ if (( ${#BW_LIST[@]} > 0 )); then
 
     # # HSL: sweep single thresholds.
     for single_thresh in "${HSL_THRESHOLDS[@]}"; do
-      cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+      cmd=( "$PYTHON_BIN" app/run_edge.py
         --algorithm hsl
         --verify_strategy single-token
         --verify_thresh_single "$single_thresh"
@@ -69,7 +69,7 @@ if (( ${#BW_LIST[@]} > 0 )); then
     # pipesd: hybrid thresholds (single x multi).
     for single_thresh in "${PIPESD_SINGLE_THRESHOLDS[@]}"; do
       for multi_thresh in "${PIPESD_MULTI_THRESHOLDS[@]}"; do
-        cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+        cmd=( "$PYTHON_BIN" app/run_edge.py
           --algorithm pipesd
           --verify_strategy hybrid
           --verify_thresh_single "$single_thresh"
@@ -87,7 +87,7 @@ if (( ${#BW_LIST[@]} > 0 )); then
 
     for init_alpha in "${INIT_ALPHA[@]}"; do
       for multiply_times in "${MULTIPLY_TIMES[@]}"; do
-        cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+        cmd=( "$PYTHON_BIN" app/run_edge.py
               --algorithm edgeLLM
               --init_alpha "$init_alpha"
               --multiply_times "$multiply_times"
@@ -111,7 +111,7 @@ else
 
     for bw in "${BANDWIDTHS_MBPS[@]}"; do
 
-      cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+      cmd=( "$PYTHON_BIN" app/run_edge.py
             --algorithm vanilla
             --verify_strategy fixed-num
             --gamma 6
@@ -126,7 +126,7 @@ else
 
       # # HSL: sweep single thresholds.
       for single_thresh in "${HSL_THRESHOLDS[@]}"; do
-        cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+        cmd=( "$PYTHON_BIN" app/run_edge.py
           --algorithm hsl
           --verify_strategy single-token
           --verify_thresh_single "$single_thresh"
@@ -143,7 +143,7 @@ else
       # pipesd: hybrid thresholds (single x multi).
       for single_thresh in "${PIPESD_SINGLE_THRESHOLDS[@]}"; do
         for multi_thresh in "${PIPESD_MULTI_THRESHOLDS[@]}"; do
-          cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+          cmd=( "$PYTHON_BIN" app/run_edge.py
             --algorithm pipesd
             --verify_strategy hybrid
             --verify_thresh_single "$single_thresh"
@@ -161,7 +161,7 @@ else
 
       for init_alpha in "${INIT_ALPHA[@]}"; do
         for multiply_times in "${MULTIPLY_TIMES[@]}"; do
-          cmd=( "$PYTHON_BIN" -m benchmark.eval_Draft
+          cmd=( "$PYTHON_BIN" app/run_edge.py
                 --algorithm edgeLLM
                 --init_alpha "$init_alpha"
                 --multiply_times "$multiply_times"

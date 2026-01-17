@@ -1,39 +1,35 @@
 # PipeSD
 
-Speculative decoding project split into a cloud verification service and an edge-side runner for experiments.
+PipeSD is a cloud-edge collaborative inference framework based on speculative decoding, with two core mechanisms:
+- Token-batch pipeline scheduling
+- Dual-threshold NAV (non-autoregressive verification)
+
+The project includes a cloud verification service and an edge-side runner for experiments.
 
 ## Repository layout
 - `cloud/`: FastAPI service that hosts the target model and verifies speculative tokens
-- `edge/`: client/runner that drives experiments and logs results
-- `README.md`: top-level overview (this file)
-
-## What lives where
-- **Models**
-  - `cloud/pre_models/`: target-model weights used by the cloud service
-  - `edge/pre_models/`: draft-model weights used by the edge runner
-  - `cloud/hfd.sh`, `edge/hfd.sh`: helper scripts for model downloads
-- **Data & results** (edge-side)
-  - `edge/data/`: datasets in JSONL (e.g., `humaneval.jsonl`, `gsm8k.jsonl`)
-  - `edge/exp/`: experiment outputs (created at runtime)
-  - `edge/figs/`: pre-generated figures
-- **Code**
-  - `cloud/src/`: FastAPI server + utilities
-  - `edge/src/`: client/runner, comms, merge logic, optimization
-  - `edge/benchmark/`: evaluation entrypoint
-  - `edge/scripts/`: sweep and ablation scripts
+- `edge/`: generates draft tokens autoregressively and sends them to the cloud for NAV
 
 ## Setup
+Cloud environment requirements:
+- Ubuntu 22.04
+- CUDA 12.1
+- Python 3.10
+
+Edge environment notes:
+- Windows 11 24H2 (CPU-only) is used in our setup.
+- Ubuntu 22.04 should also work.
+
 Each side has its own install script:
 - Cloud: `cloud/install.sh`
 - Edge: `edge/install.sh`
 
-Use them as references for required packages; adapt to your environment as needed.
+Use them as references for required packages.
 
 ## Typical flow
-1) Start the cloud service (see `cloud/README.md`).
-2) Run an edge evaluation or sweep (see `edge/README.md`).
-3) Results are written under `edge/exp/`.
+1) Start the cloud service on the cloud server (see `cloud/README.md`).
+2) Run an edge evaluation on the edge device (see `edge/README.md`).
 
 ## Notes
+- Ubuntu >= 22.04 is recommended.
 - The edge client talks to a hard-coded cloud URL in `edge/src/engine.py`. Update it to match your server address.
-- Power-integral metrics are produced by the cloud service if NVML is available.
