@@ -1,4 +1,6 @@
 import json
+import importlib
+import os
 import sys
 import tempfile
 import types
@@ -118,6 +120,7 @@ def make_args(**overrides):
         token_size_MB=0.29,
         merge_policy="dp",
         result_tag="",
+        task_id_offset=0,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -143,6 +146,18 @@ class RunEdgeTests(unittest.TestCase):
 
             self.assertEqual(len(samples), 1)
             self.assertEqual(samples[0]["prompt"], "q1")
+
+    def test_preprocess_applies_task_id_offset(self):
+        evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+        evaluator.args = SimpleNamespace(dataset="gsm8k", task_id_offset=1000)
+
+        prompt, task_id = CloudEdgeSpeculativeEval.preprocess(
+            evaluator,
+            {"prompt": "q1", "task_id": 7},
+        )
+
+        self.assertEqual(prompt, "q1")
+        self.assertEqual(task_id, 1007)
 
     def test_reset_state_initializes_tracking_fields(self):
         args = make_args()
@@ -239,6 +254,24 @@ class RunEdgeTests(unittest.TestCase):
         )
 
         self.assertEqual(waiting_spec_len, 5)
+
+    def test_engine_url_respects_env_override(self):
+        import src.engine as engine_module
+
+        previous = os.environ.get("PIPE_SD_SERVER_URL")
+        os.environ["PIPE_SD_SERVER_URL"] = "http://127.0.0.1:1597"
+        try:
+            engine_module = importlib.reload(engine_module)
+            self.assertEqual(engine_module.URL, "http://127.0.0.1:1597")
+            self.assertEqual(engine_module.INIT_ENDPOINT, "http://127.0.0.1:1597/init")
+            self.assertEqual(engine_module.PROPOSE_ENDPOINT, "http://127.0.0.1:1597/propose")
+            self.assertEqual(engine_module.EXIT_ENDPOINT, "http://127.0.0.1:1597/exit")
+        finally:
+            if previous is None:
+                os.environ.pop("PIPE_SD_SERVER_URL", None)
+            else:
+                os.environ["PIPE_SD_SERVER_URL"] = previous
+            importlib.reload(engine_module)
 
 
 if __name__ == "__main__":

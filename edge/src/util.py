@@ -79,6 +79,7 @@ def parse_arguments():
         help='Merge scheduling policy used by pipesd during speculative upload.',
     )
     parser.add_argument('--result_tag', type=str, default="", help='Optional tag appended to result filenames to isolate experiment runs.')
+    parser.add_argument('--task_id_offset', type=int, default=0, help='Offset added to each task id to avoid collisions across concurrent clients.')
     parser.add_argument(
         '--use_env_proxy',
         action='store_true',

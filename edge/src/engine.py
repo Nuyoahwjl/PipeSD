@@ -22,9 +22,13 @@ except ImportError:
     print("Warning: llama-cpp-python not found. GGUF model support disabled.")
 
 # ========== 配置 ==========
+def resolve_server_url() -> str:
+    return os.getenv("PIPE_SD_SERVER_URL", "http://115.190.90.101:1597")
+
+
 # URL = "http://39.102.209.27:6001"  # 你的云端 FastAPI 地址
 # URL = "http://106.63.100.63:30007"
-URL = "http://115.190.90.101:1597"
+URL = resolve_server_url()
 
 INIT_ENDPOINT = f"{URL}/init"
 PROPOSE_ENDPOINT = f"{URL}/propose"

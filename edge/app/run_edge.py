@@ -102,6 +102,9 @@ class CloudEdgeSpeculativeEval(Decoding):
             task_id = int(str(raw_task_id).split('/')[-1])
         except Exception:
             task_id = raw_task_id
+        task_id_offset = getattr(self.args, "task_id_offset", 0)
+        if isinstance(task_id, int):
+            task_id += task_id_offset
         return prompt, task_id
 
     def postprocess(self, input_text, output_text):
