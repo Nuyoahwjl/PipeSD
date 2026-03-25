@@ -1,10 +1,13 @@
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import List
+
+sys.path.append(os.path.join(sys.path[0], "../"))
 
 from src.multiclient import (
     build_client_command,

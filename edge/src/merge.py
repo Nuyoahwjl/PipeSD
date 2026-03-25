@@ -1,8 +1,6 @@
 import sys
 from typing import List, Tuple
 
-import pandas as pd
-
 
 def dynamic_token_scheduling_dp(
     token_compute_times: List[float],
@@ -90,6 +88,8 @@ def baseline_full_merge(token_compute_times: List[float], C: float, d: float) ->
 
 
 if __name__ == "__main__":
+    import pandas as pd
+
     compute_times = [0.037] * 20
     C_value = 0.05
     token_size_MB = 0.29
