@@ -64,6 +64,9 @@ class MyModel():
         )
         self.task_id = 0
 
+    def set_task(self, task_id: int):
+        self.task_id = task_id
+
     def sample_and_log(self, top_k: int = 1, top_p: float = 0.95, temp: float = 0.0, task_id: int = None):
         """Call the underlying Llama.sample and log internal state for debugging determinism.
 
@@ -111,9 +114,8 @@ class MyModel():
             raise
     
     def change_task(self, task_id: int):
-        self.task_id = task_id
+        self.set_task(task_id)
         self.model.reset()
-        print('清空')
 
 class InferenceTask:
     def __init__(self, task_id: int, prefix: List[int], args):
@@ -123,6 +125,7 @@ class InferenceTask:
         # self.load_model()
         shared_model.change_task(task_id)
         self.target_model = shared_model.model  # 使用共享模型实例
+        self.model_state = None
         self.n_past = 0
         self.final_token = None  # 记录上次的final_token
         # 存储累积的推测token和概率
@@ -189,7 +192,23 @@ class InferenceTask:
         with self._energy_context("init_eval"):
             self.target_model.eval(self.prefix)
         self.n_past = self.target_model.n_tokens
+        self.save_model_state()
         return self.n_past == len(self.prefix)
+
+    def save_model_state(self):
+        shared_model.set_task(self.task_id)
+        self.model_state = self.target_model.save_state()
+        self.n_past = self.target_model.n_tokens
+        return self.model_state
+
+    def restore_model_state(self):
+        shared_model.set_task(self.task_id)
+        if self.model_state is None:
+            self.target_model.reset()
+            self.n_past = self.target_model.n_tokens
+            return
+        self.target_model.load_state(self.model_state)
+        self.n_past = self.target_model.n_tokens
 
     def add_batch(self, tokens: List[int], probs: List[List[float]], index: int):
         """
@@ -414,7 +433,9 @@ async def propose(request: Request):
                 }
         
         # 执行验证，传入接收时的n_past值
+        task.restore_model_state()
         result = task.verify_tokens(n_past_at_receive)
+        task.save_model_state()
         task.veridy_num += 1
 
         return result
