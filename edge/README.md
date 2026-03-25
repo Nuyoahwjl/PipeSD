@@ -2,6 +2,8 @@
 
 Client-side code that drives speculative decoding experiments, sends proposals to the cloud service, and writes results.
 
+Detailed repository walkthrough: `docs/repo-summary.md`
+
 ## Key files
 - `src/engine.py`: core speculative decoding logic and cloud communication
 - `src/comm.py`: bandwidth-limited sender

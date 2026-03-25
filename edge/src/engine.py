@@ -23,7 +23,9 @@ except ImportError:
 
 # ========== 配置 ==========
 # URL = "http://39.102.209.27:6001"  # 你的云端 FastAPI 地址
-URL = "http://106.63.100.63:30007"
+# URL = "http://106.63.100.63:30007"
+URL = "http://115.190.90.101:1597"
+
 INIT_ENDPOINT = f"{URL}/init"
 PROPOSE_ENDPOINT = f"{URL}/propose"
 EXIT_ENDPOINT = f"{URL}/exit"
@@ -46,7 +48,7 @@ class Decoding(ABC):
         self.temp: float = getattr(args, 'temp', 0)
         self.C: float = getattr(args, 'C', 0.05)
         self.verify_strategy: str = getattr(args, 'verify_strategy', "fixed-num")
-        self.verify_num: int = getattr(args, 'gamma', 8)
+        self.verify_num: int = getattr(args, 'verify_num', 8)
         self.accumulated_probs: float = 0.0
         self.bandwidth_MBps: float = getattr(args, 'bandwidth_MBps', 2) 
         
@@ -57,7 +59,7 @@ class Decoding(ABC):
         self._token_time_ref: float = 0.0
         self._token_durations: List[float] = []
         # self.exp_name = strategy2exp(self.verify_strategy)
-        self.exp_name = os.path.join(os.getcwd(), 'exp', "exp_iot_gsm", self.args.dataset, self.algorithm)
+        self.exp_name = os.path.join(os.getcwd(), 'exp', "exp__gsm", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
         if self.algorithm == "vanilla" or self.algorithm == "hsl":
@@ -74,6 +76,9 @@ class Decoding(ABC):
         self.acc_ratio = 0.0
         self.num_spec_tokens_sent = 0
         self.num_spec_tokens_generated = 0
+        self._spec_token_indices_generated = []
+        self._spec_token_indices_sent = set()
+        self._token_time_ref = time.time()
 
         self.verify_thresh_single = self.args.verify_thresh_single
         self.verify_thresh_multi = self.args.verify_thresh_multi
@@ -90,7 +95,20 @@ class Decoding(ABC):
         end_time = time.time()
         self.color_print(f"[Edge] 模型加载完成，耗时: {end_time - start_time:.2f} 秒", 5)
 
-        self.sender = BandwidthSender(bandwidth_MBps=self.bandwidth_MBps, base_latency=self.C)
+        self.sender = BandwidthSender(
+            bandwidth_MBps=self.bandwidth_MBps,
+            base_latency=self.C,
+            use_env_proxy=getattr(self.args, "use_env_proxy", False),
+        )
+
+    def _record_token_time(self, token_count: int) -> None:
+        if token_count <= 0:
+            return
+        now = time.time()
+        elapsed = max(0.0, now - self._token_time_ref)
+        per_token = elapsed / token_count
+        self._token_durations.extend([per_token] * token_count)
+        self._token_time_ref = now
 
     def _build_histogram(self, values: List[int]) -> Dict[str, int]:
         hist: Dict[str, int] = {}
@@ -258,7 +276,9 @@ class Decoding(ABC):
                 [self.args.default_token_compute] * (self.gamma), self.C,
                 (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0
             )
-            merge_plan_batches = [len(batch) for batch in batches if batch]
+            # merge_plan_batches = [len(batch) for batch in batches if batch]
+            # merge_plan_batches = [1] * 40
+            merge_plan_batches = [100]
             print(f"[Edge] 计算得到合并计划: {merge_plan_batches}")
         else:
             merge_plan_batches = [self.gamma * 4]
@@ -440,7 +460,7 @@ class Decoding(ABC):
                 current_n_past = current_n_past + n_accepted + 1
                 if final_token != speculated_final_token:
                     self.draft_model.eval([final_token])
-                    print(f"[DEBUG] final_token 与 speculated_final_token 不同，eval final_token: {final_token}")
+                    # print(f"[DEBUG] final_token 与 speculated_final_token 不同，eval final_token: {final_token}")
                 
                 # print(f"[DEBUG] 更新状态: n_past {current_n_past - n_accepted - 1} -> {current_n_past}, accepted {n_accepted}, final_token {final_token}")
                 
@@ -526,7 +546,6 @@ class Decoding(ABC):
                         verify_result_waiting = waiting_batch_future.result()
                         if 'n_accepted' not in verify_result_waiting:
                             print(f"[Edge] 服务器返回错误: {verify_result_waiting}")
-                            self.append_log(self.log_path, {**self.info, "event": "verify_failed", "task_id": task_id, "response": verify_result_waiting})
                             return
                         n_accepted_waiting = verify_result_waiting['n_accepted']
                         final_token_waiting = verify_result_waiting['final_token']

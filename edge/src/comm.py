@@ -30,11 +30,18 @@ class PendingRequest:
             return 0
 
 class BandwidthSender:
-    def __init__(self, bandwidth_MBps: float, base_latency: float = 0.0, timeout: int = 10):
+    def __init__(
+        self,
+        bandwidth_MBps: float,
+        base_latency: float = 0.0,
+        timeout: int = 10,
+        use_env_proxy: bool = False,
+    ):
         self._q = queue.Queue()
         self._bandwidth_bytes = bandwidth_MBps * 1_000_000
         self._base_latency = base_latency
         self._timeout = timeout
+        self._use_env_proxy = use_env_proxy
         self._lock = threading.Lock()
         self._pending_requests = collections.defaultdict(collections.deque)
         self._tag_futures = collections.defaultdict(list)
@@ -170,6 +177,7 @@ class BandwidthSender:
 
     def _worker(self):
         session = requests.Session()
+        session.trust_env = self._use_env_proxy
         try:
             while True:
                 item = self._q.get()

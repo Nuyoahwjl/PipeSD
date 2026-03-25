@@ -39,8 +39,8 @@ def parse_arguments():
     """Specified arguments for running scripts."""
     parser = argparse.ArgumentParser(description='args for this file')
 
-    # parser.add_argument('--dataset', type=str, default="humaneval")
-    parser.add_argument('--dataset', type=str, default="gsm8k")
+    parser.add_argument('--dataset', type=str, default="humaneval")
+    # parser.add_argument('--dataset', type=str, default="gsm8k")
     parser.add_argument('--exp_name', '-e', type=str, default="exp_fixednum", help='folder name for storing results.')
     parser.add_argument('--seed', '-s', type=int, default=1234, help='set a random seed, which can makes the result reproducible')
     parser.add_argument('--max_generated_tokens', type=int, default=128, help='max token number generated.')
@@ -52,7 +52,7 @@ def parse_arguments():
     parser.add_argument("--ctx_size", type=int, default=16384)
     parser.add_argument("--verify_thresh_single", type=float, default=0.94)
     parser.add_argument("--verify_thresh_multi", type=float, default=0.9)
-    parser.add_argument('--C', type=float, default=0.05, help='startup cost')
+    parser.add_argument('--C', type=float, default=0.025, help='startup cost')
     parser.add_argument('--verify_strategy', type=str, default="fixed-num", choices=["fixed-num", "single-token", "multiple-tokens", "hybrid"], help='verification strategy.')
     parser.add_argument('--verify_num', type=int, default=8, help='number of tokens to verify in fixed-num strategy.')
     parser.add_argument('--bayes_optimize', action='store_true', help='Enable Bayesian optimization over hybrid thresholds.')
@@ -69,12 +69,18 @@ def parse_arguments():
     parser.add_argument('--bandwidth_MBps', type=float, default=2.5, help='bandwidth limit in MB/s.')
     parser.add_argument('--baseline_test', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--edgeLLM', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
-    parser.add_argument('--default_token_compute', type=float, default=0.144, help='Default single-token compute time used for planning.')
+    parser.add_argument('--default_token_compute', type=float, default=0.05, help='Default single-token compute time used for planning.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
+    parser.add_argument(
+        '--use_env_proxy',
+        action='store_true',
+        help='Respect HTTP(S)_PROXY and related environment variables for network communication.',
+    )
     # parser.add_argument('--send_while_generating', action='store_true', help='Enable sending tokens while generating to overlap communication and computation.')
     parser.add_argument('--algorithm', type=str, default="vanilla", choices=["vanilla", 'edgeLLM', 'hsl', 'pipesd'], help='Different algorithm choices.')
     parser.add_argument('--start_index_of_sample', type=int, default=0, help='start index of samples to eval.')
-    parser.add_argument('--end_index_of_sample', type=int, default=4, help='end index of samples to eval.')
+    parser.add_argument('--end_index_of_sample', type=int, default=0, help='end index of samples to eval.')
+    parser.add_argument('--max_samples', type=int, default=None, help='optional cap on the number of loaded samples, useful for quick debugging.')
     parser.add_argument('--ablation_study', action='store_true', help='whether to run ablation study.')
     parser.add_argument('--nomerge', action='store_true', help='whether to run no merge version.')
     args = parser.parse_args() 

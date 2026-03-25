@@ -1,0 +1,207 @@
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+def install_stub_modules():
+    torch = types.ModuleType("torch")
+
+    def no_grad():
+        def decorator(fn):
+            return fn
+        return decorator
+
+    torch.no_grad = no_grad
+    torch.multiprocessing = types.ModuleType("torch.multiprocessing")
+    torch.nn = types.ModuleType("torch.nn")
+    torch.nn.functional = types.ModuleType("torch.nn.functional")
+    sys.modules["torch"] = torch
+    sys.modules["torch.multiprocessing"] = torch.multiprocessing
+    sys.modules["torch.nn"] = torch.nn
+    sys.modules["torch.nn.functional"] = torch.nn.functional
+
+    transformers = types.ModuleType("transformers")
+    transformers.utils = SimpleNamespace(logging=SimpleNamespace(set_verbosity=lambda *_: None))
+    sys.modules["transformers"] = transformers
+
+    skopt = types.ModuleType("skopt")
+    skopt.gp_minimize = lambda *args, **kwargs: None
+    skopt_space = types.ModuleType("skopt.space")
+    skopt_space.Real = lambda *args, **kwargs: ("Real", args, kwargs)
+    sys.modules["skopt"] = skopt
+    sys.modules["skopt.space"] = skopt_space
+
+    msgpack = types.ModuleType("msgpack")
+    msgpack.packb = lambda payload: payload
+    sys.modules["msgpack"] = msgpack
+
+    pandas = types.ModuleType("pandas")
+    pandas.DataFrame = object
+    sys.modules["pandas"] = pandas
+
+    llama_cpp = types.ModuleType("llama_cpp")
+
+    class StubLlama:
+        def __init__(self, *args, **kwargs):
+            self.n_tokens = 0
+
+    llama_cpp.Llama = StubLlama
+    sys.modules["llama_cpp"] = llama_cpp
+
+
+install_stub_modules()
+
+from app.run_edge import CloudEdgeSpeculativeEval
+from src.engine import Decoding
+
+
+class FakeSender:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
+class FakeLlama:
+    def __init__(self, *args, **kwargs):
+        self.n_tokens = 0
+
+
+class DummyDecoding(Decoding):
+    def load_data(self):
+        return []
+
+    def preprocess(self, input_text):
+        return input_text, 0
+
+    def postprocess(self, input_text, output_text):
+        return output_text
+
+
+class RunEdgeTests(unittest.TestCase):
+    def test_load_data_respects_max_samples(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "gsm8k.jsonl"
+            rows = [
+                {"question": "q1", "answer": "a1"},
+                {"question": "q2", "answer": "a2"},
+            ]
+            data_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+            evaluator.args = SimpleNamespace(dataset="gsm8k", data_path=str(data_path), max_samples=1)
+            evaluator.start_index_of_sample = 0
+            evaluator.end_index_of_sample = 4
+            evaluator.color_print = lambda *args, **kwargs: None
+
+            samples = CloudEdgeSpeculativeEval.load_data(evaluator)
+
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0]["prompt"], "q1")
+
+    def test_reset_state_initializes_tracking_fields(self):
+        args = SimpleNamespace(
+            seed=1,
+            gamma=6,
+            max_generated_tokens=8,
+            top_k=1,
+            top_p=0.95,
+            temp=0.0,
+            C=0.05,
+            verify_strategy="fixed-num",
+            verify_num=3,
+            bandwidth_MBps=2.5,
+            multiply_times=0.95,
+            algorithm="vanilla",
+            start_index_of_sample=0,
+            end_index_of_sample=0,
+            dataset="gsm8k",
+            verify_thresh_single=0.94,
+            verify_thresh_multi=0.9,
+            init_alpha=0.92,
+            draft_model="fake.gguf",
+            threads=1,
+            ctx_size=64,
+            use_env_proxy=False,
+        )
+
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch("src.engine.BandwidthSender", FakeSender):
+            decoder._reset_state()
+
+        self.assertEqual(decoder.verify_num, 3)
+        self.assertEqual(decoder._spec_token_indices_generated, [])
+        self.assertEqual(decoder._spec_token_indices_sent, set())
+        self.assertFalse(decoder.sender.kwargs["use_env_proxy"])
+
+    def test_reset_state_forwards_use_env_proxy_to_sender(self):
+        args = SimpleNamespace(
+            seed=1,
+            gamma=6,
+            max_generated_tokens=8,
+            top_k=1,
+            top_p=0.95,
+            temp=0.0,
+            C=0.05,
+            verify_strategy="fixed-num",
+            verify_num=3,
+            bandwidth_MBps=2.5,
+            multiply_times=0.95,
+            algorithm="vanilla",
+            start_index_of_sample=0,
+            end_index_of_sample=0,
+            dataset="gsm8k",
+            verify_thresh_single=0.94,
+            verify_thresh_multi=0.9,
+            init_alpha=0.92,
+            draft_model="fake.gguf",
+            threads=1,
+            ctx_size=64,
+            use_env_proxy=True,
+        )
+
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch("src.engine.BandwidthSender", FakeSender):
+            decoder._reset_state()
+
+        self.assertTrue(decoder.sender.kwargs["use_env_proxy"])
+
+    def test_record_token_time_appends_per_token_durations(self):
+        args = SimpleNamespace(
+            seed=1,
+            gamma=6,
+            max_generated_tokens=8,
+            top_k=1,
+            top_p=0.95,
+            temp=0.0,
+            C=0.05,
+            verify_strategy="fixed-num",
+            verify_num=3,
+            bandwidth_MBps=2.5,
+            multiply_times=0.95,
+            algorithm="vanilla",
+            start_index_of_sample=0,
+            end_index_of_sample=0,
+            dataset="gsm8k",
+        )
+        decoder = DummyDecoding(args)
+        decoder._token_durations = []
+        decoder._token_time_ref = 100.0
+
+        with mock.patch("src.engine.time.time", return_value=106.0):
+            decoder._record_token_time(3)
+
+        self.assertEqual(decoder._token_durations, [2.0, 2.0, 2.0])
+        self.assertEqual(decoder._token_time_ref, 106.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

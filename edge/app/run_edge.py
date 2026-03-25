@@ -27,6 +27,12 @@ class CloudEdgeSpeculativeEval(Decoding):
         super().__init__(args)
         self.samples = self.load_data()
 
+    def _limit_samples_for_debug(self, samples):
+        max_samples = getattr(self.args, "max_samples", None)
+        if max_samples is None:
+            return samples
+        return samples[:max(0, max_samples)]
+
     def load_data(self):
         """
         从文件中加载并返回数据样本。
@@ -47,6 +53,7 @@ class CloudEdgeSpeculativeEval(Decoding):
                 samples = self._load_humaneval_samples(raw_samples)
 
             samples = samples[self.start_index_of_sample:self.end_index_of_sample+1]
+            samples = self._limit_samples_for_debug(samples)
             self.color_print(f"[Main] Loaded {len(samples)} samples.", 3)
             return samples
         except Exception as e:
