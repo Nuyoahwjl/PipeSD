@@ -51,9 +51,13 @@ class Decoding(ABC):
         self.verify_num: int = getattr(args, 'verify_num', 8)
         self.accumulated_probs: float = 0.0
         self.bandwidth_MBps: float = getattr(args, 'bandwidth_MBps', 2) 
+        self.merge_policy: str = getattr(args, 'merge_policy', 'dp')
+        self.verify_thresh_single = getattr(args, 'verify_thresh_single', 0.94)
+        self.verify_thresh_multi = getattr(args, 'verify_thresh_multi', 0.9)
         
         self.multiply_times: float = getattr(args, 'multiply_times', 0.7)
         self.algorithm = getattr(args, 'algorithm', "vanilla")
+        self.result_tag: str = getattr(args, 'result_tag', "")
         self.start_index_of_sample = getattr(args, 'start_index_of_sample', 0)
         self.end_index_of_sample = getattr(args, 'end_index_of_sample', 1)
         self._token_time_ref: float = 0.0
@@ -101,6 +105,19 @@ class Decoding(ABC):
             use_env_proxy=getattr(self.args, "use_env_proxy", False),
         )
 
+    def _resolve_merge_plan(self) -> List[int]:
+        if self.merge_policy == "immediate":
+            return [1] * 40
+        if self.merge_policy == "no_early":
+            return [100]
+
+        batches, _ = dynamic_token_scheduling_dp(
+            [self.args.default_token_compute] * self.gamma,
+            self.C,
+            (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
+        )
+        return [len(batch) for batch in batches if batch] or [self.gamma * 4]
+
     def _record_token_time(self, token_count: int) -> None:
         if token_count <= 0:
             return
@@ -123,6 +140,41 @@ class Decoding(ABC):
         arr = np.array(values, dtype=np.float32)
         quantiles = np.quantile(arr, probs)
         return {f"p{int(p * 100)}": float(q) for p, q in zip(probs, quantiles)}
+
+    def _build_verify_diagnostics(self, output_length: int) -> Dict[str, object]:
+        spec_lengths = list(self.verify_spec_lengths)
+        accept_lengths = list(self.verify_accept_lengths)
+        rejected_lengths = [spec - accept for spec, accept in zip(spec_lengths, accept_lengths)]
+        num_verifications = len(spec_lengths)
+
+        def mean_or_none(values: List[int]):
+            if not values:
+                return None
+            return float(sum(values) / len(values))
+
+        rollback_events = sum(1 for rejected in rejected_lengths if rejected > 0)
+        return {
+            'draft_lengths': spec_lengths,
+            'accepted_lengths': accept_lengths,
+            'rejected_lengths': rejected_lengths,
+            'draft_length_hist': self._build_histogram(spec_lengths),
+            'accepted_length_hist': self._build_histogram(accept_lengths),
+            'rejected_length_hist': self._build_histogram(rejected_lengths),
+            'draft_length_quantiles': self._build_quantiles(spec_lengths),
+            'accepted_length_quantiles': self._build_quantiles(accept_lengths),
+            'rejected_length_quantiles': self._build_quantiles(rejected_lengths),
+            'mean_verify_spec_len': mean_or_none(spec_lengths),
+            'mean_accept_len': mean_or_none(accept_lengths),
+            'mean_rejected_len': mean_or_none(rejected_lengths),
+            'rollback_events': rollback_events,
+            'rollback_rate': float(rollback_events / num_verifications) if num_verifications else 0.0,
+            'verification_frequency': float(num_verifications / output_length) if output_length > 0 else None,
+            'accepted_per_verification': mean_or_none(accept_lengths),
+            'draft_per_verification': mean_or_none(spec_lengths),
+        }
+
+    def _resolve_waiting_verify_length(self, waiting_tokens: List[int], waiting_batch_tokens: List[int]) -> int:
+        return len(waiting_tokens)
     
     def if_verify(self, probs_draft, verify_mode):
         """
@@ -200,27 +252,32 @@ class Decoding(ABC):
             self.alpha = min(1.99, self.alpha)
     
     def exp2path(self, bandwidth_label: str):
+        merge_suffix = ""
+        if self.algorithm == "pipesd":
+            merge_suffix = f"_merge={self.merge_policy}"
+        tag_suffix = f"_tag={self.result_tag}" if self.result_tag else ""
+
         if 'edgeLLM' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}_bw={bandwidth_label}MB.json")
+            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}{tag_suffix}_bw={bandwidth_label}MB.json")
         elif 'single' in self.exp_name or 'hsl' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+            saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}{tag_suffix}_bw={bandwidth_label}MB.json")
         elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
             if self.args.ablation_study:
                 if self.args.verify_strategy == 'single-token':
-                    saved_path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"ab_single_st={self.verify_thresh_single}{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
                 elif self.args.verify_strategy == 'multiple-tokens':
-                    saved_path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"ab_multi_ia={self.args.init_alpha}_mt={self.multiply_times}{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
                 elif self.args.verify_strategy == 'fixed-num':
-                    saved_path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"ab_fixed_gamma={self.gamma}{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
                 else:
-                    saved_path = os.path.join(self.exp_name, f"ab_nomerge_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"ab_nomerge{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
             else:
                 if self.args.bayes_optimize:
-                    saved_path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"bc={self.args.bayes_calls}_bound={self.args.bayes_single_min}-{self.args.bayes_single_max}-{self.args.bayes_multi_min}-{self.args.bayes_multi_max}{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
                 else:
-                    saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}_bw={bandwidth_label}MB.json")
+                    saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}_mt={self.verify_thresh_multi}{merge_suffix}{tag_suffix}_bw={bandwidth_label}MB.json")
         else:
-            saved_path = os.path.join(self.exp_name, f"gamma_{self.gamma}_bw={bandwidth_label}MB.json")
+            saved_path = os.path.join(self.exp_name, f"gamma_{self.gamma}{tag_suffix}_bw={bandwidth_label}MB.json")
 
         return saved_path
     
@@ -272,13 +329,7 @@ class Decoding(ABC):
         current_batch_indices = []
 
         if ('merge' in self.algorithm or 'pipesd' in self.algorithm) and not self.args.nomerge:
-            batches, _ = dynamic_token_scheduling_dp(
-                [self.args.default_token_compute] * (self.gamma), self.C,
-                (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0
-            )
-            # merge_plan_batches = [len(batch) for batch in batches if batch]
-            # merge_plan_batches = [1] * 40
-            merge_plan_batches = [100]
+            merge_plan_batches = self._resolve_merge_plan()
             print(f"[Edge] 计算得到合并计划: {merge_plan_batches}")
         else:
             merge_plan_batches = [self.gamma * 4]
@@ -445,6 +496,7 @@ class Decoding(ABC):
                 final_token = verify_result['final_token']
                 self.verify_spec_lengths.append(len(total_speculative_tokens))
                 self.verify_accept_lengths.append(n_accepted)
+                self.verify_his.append((len(total_speculative_tokens), n_accepted))
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
@@ -549,7 +601,10 @@ class Decoding(ABC):
                             return
                         n_accepted_waiting = verify_result_waiting['n_accepted']
                         final_token_waiting = verify_result_waiting['final_token']
-                        waiting_spec_len = len(waiting_batch_tokens) if waiting_batch_tokens else 0
+                        waiting_spec_len = self._resolve_waiting_verify_length(
+                            waiting_tokens=waiting_tokens,
+                            waiting_batch_tokens=waiting_batch_tokens,
+                        )
                         self.verify_spec_lengths.append(waiting_spec_len)
                         self.verify_accept_lengths.append(n_accepted_waiting)
                         self.verify_his.append((waiting_spec_len, n_accepted_waiting))
@@ -633,16 +688,19 @@ class Decoding(ABC):
         saved_path = self.exp2path(bandwidth_label)        
 
         os.makedirs(self.exp_name, exist_ok=True) 
+        output_length = len(output_tokens) - prefix_len
         avg_token_time = float(sum(self._token_durations) / len(self._token_durations)) if self._token_durations else None
+        diagnostics = self._build_verify_diagnostics(output_length)
         exp_result = {
             'task_id': task_id,
-            'output_length': len(output_tokens) - prefix_len,
+            'output_length': output_length,
             # 'counted_length': eff_num,
             'total_time': spent_time,
             'output': decoded_text,
             'gamma': self.gamma,
             'max_len': self.max_len,
             'strategy': self.verify_strategy,
+            'merge_policy': self.merge_policy,
             'bandwidth_MBps': self.bandwidth_MBps,
             'thresh_single': self.verify_thresh_single,
             'thresh_multi': self.verify_thresh_multi,
@@ -652,7 +710,10 @@ class Decoding(ABC):
             'gpu_power_integral_joules': exit_result.get('gpu_power_integral_joules', None),
             'verify_num': exit_result.get('verify_num', None),
             'acc_ratio': self.acc_ratio / len(self.verify_spec_lengths) if self.verify_spec_lengths else 0.0,
+            'verify_spec_lengths': self.verify_spec_lengths,
+            'verify_accept_lengths': self.verify_accept_lengths,
             'verify_his': self.verify_his,
+            'diagnostics': diagnostics,
         }
         # 读取已有数据
         if os.path.exists(saved_path):

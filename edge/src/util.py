@@ -69,8 +69,16 @@ def parse_arguments():
     parser.add_argument('--bandwidth_MBps', type=float, default=2.5, help='bandwidth limit in MB/s.')
     parser.add_argument('--baseline_test', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--edgeLLM', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
-    parser.add_argument('--default_token_compute', type=float, default=0.05, help='Default single-token compute time used for planning.')
+    parser.add_argument('--default_token_compute', type=float, default=0.036, help='Default single-token compute time used for planning.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
+    parser.add_argument(
+        '--merge_policy',
+        type=str,
+        default='dp',
+        choices=['dp', 'immediate', 'no_early'],
+        help='Merge scheduling policy used by pipesd during speculative upload.',
+    )
+    parser.add_argument('--result_tag', type=str, default="", help='Optional tag appended to result filenames to isolate experiment runs.')
     parser.add_argument(
         '--use_env_proxy',
         action='store_true',
