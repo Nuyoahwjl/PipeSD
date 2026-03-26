@@ -9,6 +9,7 @@ import numpy as np
 import json
 import os
 import logging
+import threading
 import torch
 from contextlib import nullcontext
 from src.util import seed_everything, parse_arguments, softmax, max_fn, sample, GPUEnergyMonitor, EnergyTracker
@@ -123,9 +124,10 @@ class InferenceTask:
         self.prefix = prefix
         self.args = args
         # self.load_model()
-        shared_model.change_task(task_id)
+        shared_model.set_task(task_id)
         self.target_model = shared_model.model  # 使用共享模型实例
         self.model_state = None
+        self.lock = threading.RLock()
         self.n_past = 0
         self.final_token = None  # 记录上次的final_token
         # 存储累积的推测token和概率
@@ -189,6 +191,8 @@ class InferenceTask:
         )
         
     def proc_prefix(self):
+        shared_model.set_task(self.task_id)
+        self.target_model.reset()
         with self._energy_context("init_eval"):
             self.target_model.eval(self.prefix)
         self.n_past = self.target_model.n_tokens
@@ -368,20 +372,89 @@ class InferenceTask:
 
 # 全局任务字典
 active_tasks: Dict[int, InferenceTask] = {}
+active_tasks_lock = threading.RLock()
+model_lock = threading.RLock()
+
+
+def handle_init_request(request: InitRequest):
+    args = parse_arguments()
+    task = InferenceTask(request.task_id, request.tokens, args)
+    with task.lock:
+        with model_lock:
+            success = task.proc_prefix()
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to process prefix tokens.")
+
+    with active_tasks_lock:
+        active_tasks[request.task_id] = task
+
+    return {'init': 'success', 'n_past': task.n_past}
+
+
+def handle_propose_payload(payload):
+    task_id = payload.get('task_id')
+    with active_tasks_lock:
+        task = active_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=400, detail="Task not found or not initialized.")
+
+    tokens = payload.get('tokens', [])
+    probs = payload.get('probs', [])
+    should_verify = payload.get('should_verify', False)
+    n_past_at_receive = payload.get('n_past', task.n_past)
+
+    with task.lock:
+        index = payload.get('index', len([t for t in task.accumulated_tokens if t is not None]))
+
+        if should_verify:
+            task.add_batch(tokens, probs, index)
+
+            if payload.get('type') == 'propose_waiting':
+                logger.info(f"等待期间的验证,tokens: {tokens}")
+                if not task.last_verify_pass:
+                    return {
+                        'status': 'last verify failed, drop',
+                        'n_past': task.n_past,
+                        'total_accumulated': len([t for t in task.accumulated_tokens if t is not None])
+                    }
+
+            with model_lock:
+                task.restore_model_state()
+                result = task.verify_tokens(n_past_at_receive)
+                task.save_model_state()
+                task.veridy_num += 1
+            return result
+
+        add_result = task.add_batch(tokens, probs, index)
+        return {
+            'status': 'accumulated',
+            'n_past': task.n_past,
+            'total_accumulated': len([t for t in task.accumulated_tokens if t is not None]),
+            'add_result': add_result
+        }
+
+
+def handle_exit_payload(payload):
+    response = {"status": "exited"}
+
+    if payload.get('type') == 'exit':
+        task_id = payload.get('task_id')
+        response['task_id'] = task_id
+        with active_tasks_lock:
+            task = active_tasks.pop(task_id, None) if task_id is not None else None
+        if task is not None:
+            power_int = task.total_gpu_power_integral_joules
+            response['gpu_power_integral_joules'] = power_int
+            response['verify_num'] = task.veridy_num
+            logger.info("task=%s gpu_power_integral_total=%.6fJ (final)", task_id, power_int)
+
+    return response
 
 @app.post("/init")
 async def init(request: InitRequest):  # 直接使用 Pydantic 模型
-    args = parse_arguments()
-    task = InferenceTask(request.task_id, request.tokens, args)
-    success = task.proc_prefix()
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to process prefix tokens.")
-    
-    # 存储任务实例
-    active_tasks[request.task_id] = task
-    
-    resp = {'init': 'success', 'n_past': task.n_past}
-    return resp
+    from anyio.to_thread import run_sync
+
+    return await run_sync(handle_init_request, request)
 
 @app.post("/delay")
 async def delay(request: Request):
@@ -395,77 +468,25 @@ async def delay(request: Request):
 
 @app.post("/propose")
 async def propose(request: Request):
-    global active_tasks
     raw_body = await request.body()
     
     try:
         payload = msgpack.unpackb(raw_body, raw=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid msgpack data: {str(e)}")
-    
-    task_id = payload.get('task_id')
-    if task_id not in active_tasks:
-        raise HTTPException(status_code=400, detail="Task not found or not initialized.")
-    
-    task = active_tasks[task_id]
-    
-    tokens = payload.get('tokens', [])
-    probs = payload.get('probs', [])
-    index = payload.get('index', len([t for t in task.accumulated_tokens if t is not None]))
-    should_verify = payload.get('should_verify', False)
-    n_past_at_receive = payload.get('n_past', task.n_past)  # 接收时的n_past值
-    
-    # print(f"[DEBUG] Received propose: tokens={tokens}, index={index}, should_verify={should_verify}, n_past={n_past_at_receive}")
-    
-    if should_verify:
-        
-        # 添加当前批次数据
-        task.add_batch(tokens, probs, index)
 
-        if payload.get('type') == 'propose_waiting':
-            logger.info(f"等待期间的验证,tokens: {tokens}")
-            if not task.last_verify_pass:
-                # 仅等待，不进行验证
-                return {
-                    'status': 'last verify failed, drop',
-                    'n_past': task.n_past,
-                    'total_accumulated': len([t for t in task.accumulated_tokens if t is not None])
-                }
-        
-        # 执行验证，传入接收时的n_past值
-        task.restore_model_state()
-        result = task.verify_tokens(n_past_at_receive)
-        task.save_model_state()
-        task.veridy_num += 1
+    from anyio.to_thread import run_sync
 
-        return result
-    else:
-        # 只是累积数据，不进行验证
-        add_result = task.add_batch(tokens, probs, index)
-        return {
-            'status': 'accumulated',
-            'n_past': task.n_past,
-            'total_accumulated': len([t for t in task.accumulated_tokens if t is not None]),
-            'add_result': add_result
-        }
+    return await run_sync(handle_propose_payload, payload)
 
 @app.post("/exit")
 async def exit_task(request: Request):
     raw_body = await request.body()
     payload = msgpack.unpackb(raw_body, raw=False)
-    response = {"status": "exited"}
 
-    if payload.get('type') == 'exit':
-        task_id = payload.get('task_id')
-        response['task_id'] = task_id
-        task = active_tasks.pop(task_id, None) if task_id is not None else None
-        if task is not None:
-            power_int = task.total_gpu_power_integral_joules
-            response['gpu_power_integral_joules'] = power_int
-            response['verify_num'] = task.veridy_num
-            logger.info("task=%s gpu_power_integral_total=%.6fJ (final)", task_id, power_int)
+    from anyio.to_thread import run_sync
 
-    return response
+    return await run_sync(handle_exit_payload, payload)
 
 @app.get("/health")
 async def health():

@@ -1,5 +1,7 @@
 import importlib.util
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -198,6 +200,103 @@ class CloudServerTaskStateTests(unittest.TestCase):
 
         self.assertEqual(module.shared_model.model.n_tokens, 3)
         self.assertEqual(module.shared_model.model.history, [1, 2, 3])
+
+    def test_inference_task_init_does_not_reset_shared_model(self):
+        module = load_module()
+        args = module.parse_arguments()
+
+        module.shared_model.model.eval([99])
+        self.assertEqual(module.shared_model.model.n_tokens, 1)
+
+        module.InferenceTask(task_id=7, prefix=[1, 2], args=args)
+
+        self.assertEqual(module.shared_model.model.n_tokens, 1)
+        self.assertEqual(module.shared_model.model.history, [99])
+
+    def test_handle_propose_payload_allows_parallel_accumulate_for_distinct_tasks(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+
+        task_a = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task_b = module.InferenceTask(task_id=2, prefix=[2], args=args)
+        module.active_tasks[1] = task_a
+        module.active_tasks[2] = task_b
+
+        def slow_add_batch(tokens, probs, index):
+            time.sleep(0.2)
+            return True
+
+        task_a.add_batch = slow_add_batch
+        task_b.add_batch = slow_add_batch
+
+        payload_a = {"task_id": 1, "tokens": [10], "probs": [[1.0] * 8], "index": 0, "should_verify": False}
+        payload_b = {"task_id": 2, "tokens": [20], "probs": [[1.0] * 8], "index": 0, "should_verify": False}
+
+        results = []
+
+        def run(payload):
+            results.append(module.handle_propose_payload(payload))
+
+        started = time.perf_counter()
+        thread_a = threading.Thread(target=run, args=(payload_a,))
+        thread_b = threading.Thread(target=run, args=(payload_b,))
+        thread_a.start()
+        thread_b.start()
+        thread_a.join()
+        thread_b.join()
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(results), 2)
+        self.assertLess(elapsed, 0.35)
+
+    def test_handle_propose_payload_serializes_verify_across_tasks(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+
+        task_a = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task_b = module.InferenceTask(task_id=2, prefix=[2], args=args)
+        module.active_tasks[1] = task_a
+        module.active_tasks[2] = task_b
+
+        def fast_add_batch(tokens, probs, index):
+            return True
+
+        def slow_verify(n_past_at_verify):
+            time.sleep(0.2)
+            return {
+                "n_accepted": 1,
+                "n_speculative": 1,
+                "final_token": 1,
+                "n_past": n_past_at_verify + 1,
+            }
+
+        for task in (task_a, task_b):
+            task.add_batch = fast_add_batch
+            task.restore_model_state = lambda: None
+            task.save_model_state = lambda: None
+            task.verify_tokens = slow_verify
+
+        payload_a = {"task_id": 1, "tokens": [10], "probs": [[1.0] * 8], "index": 0, "should_verify": True, "n_past": 1}
+        payload_b = {"task_id": 2, "tokens": [20], "probs": [[1.0] * 8], "index": 0, "should_verify": True, "n_past": 1}
+
+        results = []
+
+        def run(payload):
+            results.append(module.handle_propose_payload(payload))
+
+        started = time.perf_counter()
+        thread_a = threading.Thread(target=run, args=(payload_a,))
+        thread_b = threading.Thread(target=run, args=(payload_b,))
+        thread_a.start()
+        thread_b.start()
+        thread_a.join()
+        thread_b.join()
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(results), 2)
+        self.assertGreater(elapsed, 0.35)
 
 
 if __name__ == "__main__":
