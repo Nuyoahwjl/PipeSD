@@ -1,5 +1,6 @@
 import importlib.util
 import builtins
+import os
 import sys
 import types
 import unittest
@@ -96,6 +97,24 @@ class RunEdgeOptionalSkoptTests(unittest.TestCase):
             sys.modules.update(saved_modules)
 
         self.assertTrue(hasattr(module, "CloudEdgeSpeculativeEval"))
+
+    def test_import_preserves_existing_cuda_visible_devices(self):
+        module_name = "run_edge_preserve_cuda_visible_devices"
+        sys.modules.pop(module_name, None)
+        saved_modules = dict(sys.modules)
+
+        try:
+            install_stub_modules()
+            spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+
+            with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "1"}, clear=False):
+                spec.loader.exec_module(module)
+                self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "1")
+        finally:
+            sys.modules.clear()
+            sys.modules.update(saved_modules)
 
 
 if __name__ == "__main__":

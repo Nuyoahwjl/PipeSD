@@ -13,8 +13,8 @@ from src.util import seed_everything, parse_arguments
 from src.engine import Decoding
 import torch.multiprocessing as mp
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
 
 # 1. 更改类名，使其更贴切
 class CloudEdgeSpeculativeEval(Decoding):
