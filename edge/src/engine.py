@@ -99,7 +99,7 @@ class Decoding(ABC):
         start_time = time.time()
         if not self.draft_model:
             self.draft_model = Llama(
-                model_path=self.args.draft_model, n_gpu_layers=0, n_threads=self.args.threads,
+                model_path=self.args.draft_model, n_gpu_layers=self.args.draft_n_gpu_layers, n_threads=self.args.threads,
                 verbose=False, logits_all=True, n_ctx=self.args.ctx_size,
             )
         end_time = time.time()

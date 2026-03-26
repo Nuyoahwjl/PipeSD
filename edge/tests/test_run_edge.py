@@ -71,6 +71,7 @@ class FakeSender:
 class FakeLlama:
     def __init__(self, *args, **kwargs):
         self.n_tokens = 0
+        self.kwargs = kwargs
 
 
 class DummyDecoding(Decoding):
@@ -108,6 +109,7 @@ def make_args(**overrides):
         threads=1,
         ctx_size=64,
         use_env_proxy=False,
+        server_timeout_s=10,
         ablation_study=False,
         bayes_optimize=False,
         bayes_calls=15,
@@ -121,6 +123,7 @@ def make_args(**overrides):
         merge_policy="dp",
         result_tag="",
         task_id_offset=0,
+        draft_n_gpu_layers=0,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -183,6 +186,28 @@ class RunEdgeTests(unittest.TestCase):
             decoder._reset_state()
 
         self.assertTrue(decoder.sender.kwargs["use_env_proxy"])
+
+    def test_reset_state_forwards_server_timeout_to_sender(self):
+        args = make_args(server_timeout_s=45)
+
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch("src.engine.BandwidthSender", FakeSender):
+            decoder._reset_state()
+
+        self.assertEqual(decoder.sender.kwargs["timeout"], 45)
+
+    def test_reset_state_forwards_draft_n_gpu_layers_to_llama(self):
+        args = make_args(draft_n_gpu_layers=-1)
+
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch("src.engine.BandwidthSender", FakeSender):
+            decoder._reset_state()
+
+        self.assertEqual(decoder.draft_model.kwargs["n_gpu_layers"], -1)
 
     def test_record_token_time_appends_per_token_durations(self):
         args = make_args()
