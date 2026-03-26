@@ -6,6 +6,11 @@
 2. 代码实际是怎么跑起来的
 3. 哪些地方是“设计如此”，哪些地方是“当前实现细节”
 
+如果要看 2026-03-26 当前“单 server 对多 client”实验链路的真实实现状态，请优先结合：
+
+- `docs/multiclient-implementation-summary.md`
+- `docs/cloud-server-summary.md`
+
 ## 1. 项目定位
 
 这是一个边缘端实验仓库，用来运行 speculative decoding 相关实验。它本身不是完整的云服务，而是客户端/实验驱动端：
