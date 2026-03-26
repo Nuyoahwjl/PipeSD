@@ -66,6 +66,8 @@ class Decoding(ABC):
         self.end_index_of_sample = getattr(args, 'end_index_of_sample', 1)
         self._token_time_ref: float = 0.0
         self._token_durations: List[float] = []
+        self.process_started_at: float = time.time()
+        self.process_model_ready_at: float = self.process_started_at
         # self.exp_name = strategy2exp(self.verify_strategy)
         self.exp_name = os.path.join(os.getcwd(), 'exp', "exp__gsm", self.args.dataset, self.algorithm)
         print(self.exp_name)
@@ -101,11 +103,14 @@ class Decoding(ABC):
                 verbose=False, logits_all=True, n_ctx=self.args.ctx_size,
             )
         end_time = time.time()
+        if self.draft_model and self.process_model_ready_at == self.process_started_at:
+            self.process_model_ready_at = end_time
         self.color_print(f"[Edge] 模型加载完成，耗时: {end_time - start_time:.2f} 秒", 5)
 
         self.sender = BandwidthSender(
             bandwidth_MBps=self.bandwidth_MBps,
             base_latency=self.C,
+            timeout=getattr(self.args, "server_timeout_s", 10),
             use_env_proxy=getattr(self.args, "use_env_proxy", False),
         )
 
@@ -700,6 +705,10 @@ class Decoding(ABC):
             'output_length': output_length,
             # 'counted_length': eff_num,
             'total_time': spent_time,
+            'sample_started_at': total_start_time,
+            'sample_finished_at': total_end_time,
+            'process_started_at': self.process_started_at,
+            'process_model_ready_at': self.process_model_ready_at,
             'output': decoded_text,
             'gamma': self.gamma,
             'max_len': self.max_len,

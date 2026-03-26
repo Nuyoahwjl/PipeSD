@@ -46,6 +46,32 @@ class MultiClientHelpersTests(unittest.TestCase):
         self.assertEqual(metrics["sample_throughput_sps"], 0.4)
         self.assertAlmostEqual(metrics["energy_per_token_joules"], 20.0 / 30.0)
         self.assertEqual(metrics["energy_per_sample_joules"], 10.0)
+        self.assertIsNone(metrics["sample_window_makespan_seconds"])
+        self.assertIsNone(metrics["sample_window_token_throughput_tps"])
+        self.assertIsNone(metrics["sample_window_sample_throughput_sps"])
+
+    def test_summarize_multiclient_metrics_reports_sample_window_when_timestamps_exist(self):
+        metrics = summarize_multiclient_metrics(
+            entries=[
+                {
+                    "output_length": 12,
+                    "gpu_power_integral_joules": 8.0,
+                    "sample_started_at": 10.0,
+                    "sample_finished_at": 16.0,
+                },
+                {
+                    "output_length": 18,
+                    "gpu_power_integral_joules": 12.0,
+                    "sample_started_at": 12.0,
+                    "sample_finished_at": 18.0,
+                },
+            ],
+            makespan=20.0,
+        )
+
+        self.assertEqual(metrics["sample_window_makespan_seconds"], 8.0)
+        self.assertEqual(metrics["sample_window_token_throughput_tps"], 30.0 / 8.0)
+        self.assertEqual(metrics["sample_window_sample_throughput_sps"], 2.0 / 8.0)
 
     def test_build_client_result_tag_is_stable_and_distinct(self):
         self.assertEqual(build_client_result_tag("pilot", 0), "pilot_client0")

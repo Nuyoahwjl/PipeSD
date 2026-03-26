@@ -42,6 +42,27 @@ def summarize_multiclient_metrics(entries: List[Dict[str, float]], makespan: flo
     sample_throughput = float(num_completed_samples / makespan) if makespan > 0 else 0.0
     energy_per_token = float(total_cloud_energy / total_output_tokens) if total_output_tokens > 0 else 0.0
     energy_per_sample = float(total_cloud_energy / num_completed_samples) if num_completed_samples > 0 else 0.0
+    sample_starts = [
+        float(entry["sample_started_at"])
+        for entry in entries
+        if entry.get("sample_started_at") is not None and entry.get("sample_finished_at") is not None
+    ]
+    sample_finishes = [
+        float(entry["sample_finished_at"])
+        for entry in entries
+        if entry.get("sample_started_at") is not None and entry.get("sample_finished_at") is not None
+    ]
+    sample_window_makespan = None
+    sample_window_token_throughput = None
+    sample_window_sample_throughput = None
+    if sample_starts and sample_finishes:
+        sample_window_makespan = max(0.0, max(sample_finishes) - min(sample_starts))
+        if sample_window_makespan > 0:
+            sample_window_token_throughput = float(total_output_tokens / sample_window_makespan)
+            sample_window_sample_throughput = float(num_completed_samples / sample_window_makespan)
+        else:
+            sample_window_token_throughput = 0.0
+            sample_window_sample_throughput = 0.0
     return {
         "makespan_seconds": float(makespan),
         "total_output_tokens": total_output_tokens,
@@ -51,6 +72,9 @@ def summarize_multiclient_metrics(entries: List[Dict[str, float]], makespan: flo
         "sample_throughput_sps": sample_throughput,
         "energy_per_token_joules": energy_per_token,
         "energy_per_sample_joules": energy_per_sample,
+        "sample_window_makespan_seconds": sample_window_makespan,
+        "sample_window_token_throughput_tps": sample_window_token_throughput,
+        "sample_window_sample_throughput_sps": sample_window_sample_throughput,
     }
 
 
