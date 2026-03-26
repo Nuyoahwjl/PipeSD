@@ -12,8 +12,6 @@ from multiprocessing import Queue
 from src.util import seed_everything, parse_arguments
 from src.engine import Decoding
 import torch.multiprocessing as mp
-from skopt import gp_minimize
-from skopt.space import Real
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"
@@ -148,6 +146,14 @@ class CloudEdgeSpeculativeEval(Decoding):
         return latencies
 
     def bayes_optimize_thresholds(self):
+        try:
+            from skopt import gp_minimize
+            from skopt.space import Real
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Bayesian optimization requires scikit-optimize (`skopt`). "
+                "Install it or run without --bayes_optimize."
+            ) from exc
         if not self.samples:
             self.color_print("[Main] 无样本可用于贝叶斯优化，直接退出。", 1)
             return
