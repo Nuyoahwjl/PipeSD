@@ -101,6 +101,29 @@ def softmax(x, axis=-1):
     return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
 
 
+def max_fn(x):
+    clipped = np.maximum(np.asarray(x, dtype=np.float64), 0.0)
+    total = clipped.sum()
+    if total <= 0:
+        return np.full_like(clipped, 1.0 / clipped.size, dtype=np.float64)
+    return clipped / total
+
+
+def sample(probs, *_args, seed=None, **_kwargs):
+    probs = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if probs.size == 0:
+        raise ValueError("sample() requires a non-empty probability vector")
+
+    total = probs.sum()
+    if total <= 0:
+        probs = np.full(probs.shape[0], 1.0 / probs.shape[0], dtype=np.float64)
+    else:
+        probs = probs / total
+
+    rng = np.random.default_rng(seed)
+    return int(rng.choice(probs.shape[0], p=probs))
+
+
 class GPUEnergyMonitor:
     """Wraps NVML power access so we can compute inference power integrals."""
 
