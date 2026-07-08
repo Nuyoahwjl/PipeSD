@@ -61,7 +61,7 @@ def summarize_rows(rows):
 
 
 def build_paths(args):
-    base = Path("exp/exp__gsm") / args.dataset
+    base = Path("exp/exp__wjl") / args.dataset
     tag = f"_tag={args.result_tag}" if args.result_tag else ""
     bw = f"{args.bandwidth:g}"
     return {

@@ -43,7 +43,7 @@ def load_total_samples(dataset: str) -> int:
 
 
 def load_entries_for_tag(dataset: str, algorithm: str, result_tag: str) -> List[dict]:
-    exp_dir = Path("exp") / "exp__gsm" / dataset / algorithm
+    exp_dir = Path("exp") / "exp__wjl" / dataset / algorithm
     entries: List[dict] = []
     if not exp_dir.exists():
         return entries
