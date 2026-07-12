@@ -141,7 +141,7 @@ class CloudEdgeSpeculativeEval(Decoding):
             sample = next(samples_iter)
             prompt, task_id = self.preprocess(sample)
             self._reset_state()
-            self.edge_process_draft_model(prompt, task_id)
+            self.edge_process_draft_model(prompt, task_id, persist_result=False)
             latencies.extend(self._token_durations)
         return latencies
 
@@ -157,7 +157,7 @@ class CloudEdgeSpeculativeEval(Decoding):
         if not self.samples:
             self.color_print("[Main] 无样本可用于贝叶斯优化，直接退出。", 1)
             return
-        tokens_target = getattr(self.args, "bayes_tokens_per_trial", 50)
+        tokens_target = getattr(self.args, "bayes_tokens_per_trial", 20)
         log_path = Path(self.exp_name) / "bayes_trials.json"
         search_space = [
             Real(self.args.bayes_single_min, self.args.bayes_single_max, name="verify_thresh_single"),
@@ -187,8 +187,10 @@ class CloudEdgeSpeculativeEval(Decoding):
         result = gp_minimize(
             func=objective,
             dimensions=search_space,
-            n_calls=getattr(self.args, "bayes_calls", 15),
-            n_initial_points=getattr(self.args, "bayes_init_points", 5),
+            n_calls=getattr(self.args, "bayes_calls", 16),
+            n_initial_points=getattr(self.args, "bayes_init_points", 1),
+            acq_func="EI",
+            xi=getattr(self.args, "bayes_ei_xi", 0.1),
             random_state=self.seed,
         )
         best_single, best_multi = result.x
@@ -202,6 +204,11 @@ class CloudEdgeSpeculativeEval(Decoding):
             f"[Bayes] 最优阈值: st={best_single:.4f}, mt={best_multi:.4f}, avg={result.fun:.6f}",
             2,
         )
+        self.args.verify_thresh_single = float(best_single)
+        self.args.verify_thresh_multi = float(best_multi)
+        self.verify_thresh_single = float(best_single)
+        self.verify_thresh_multi = float(best_multi)
+        return best_record
 
     @torch.no_grad()
     def eval(self):
@@ -210,7 +217,10 @@ class CloudEdgeSpeculativeEval(Decoding):
                 self.color_print("[Main] 当前策略非 hybrid，将自动切换为 hybrid 进行阈值搜索。", 3)
                 self.verify_strategy = "hybrid"
             self.bayes_optimize_thresholds()
-            return
+            if getattr(self.args, "bayes_only", False):
+                self.color_print("[Main] BO 完成，已按 --bayes_only 跳过正式评测。", 2)
+                return
+            self.color_print("[Main] BO 完成，使用最优阈值继续正式评测。", 2)
         # start_time = time.time()
         seed_everything(self.args.seed)
         for i in range(1):

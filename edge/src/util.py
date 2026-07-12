@@ -43,7 +43,7 @@ def parse_arguments():
     # parser.add_argument('--dataset', type=str, default="gsm8k")
     parser.add_argument('--exp_name', '-e', type=str, default="exp_fixednum", help='folder name for storing results.')
     parser.add_argument('--seed', '-s', type=int, default=1234, help='set a random seed, which can makes the result reproducible')
-    parser.add_argument('--max_generated_tokens', type=int, default=1024, help='max token number generated.')
+    parser.add_argument('--max_generated_tokens', type=int, default=128, help='max token number generated.')
     parser.add_argument('--temp', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=1, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
@@ -57,13 +57,15 @@ def parse_arguments():
     parser.add_argument('--verify_strategy', type=str, default="fixed-num", choices=["fixed-num", "single-token", "multiple-tokens", "hybrid"], help='verification strategy.')
     parser.add_argument('--verify_num', type=int, default=8, help='number of tokens to verify in fixed-num strategy.')
     parser.add_argument('--bayes_optimize', action='store_true', help='Enable Bayesian optimization over hybrid thresholds.')
-    parser.add_argument('--bayes_calls', type=int, default=15, help='Total Bayesian optimization iterations.')
-    parser.add_argument('--bayes_init_points', type=int, default=5, help='Number of random init points before GP proposals.')
-    parser.add_argument('--bayes_single_min', type=float, default=0.6, help='Lower bound for verify_thresh_single search.')
-    parser.add_argument('--bayes_single_max', type=float, default=0.99, help='Upper bound for verify_thresh_single search.')
-    parser.add_argument('--bayes_multi_min', type=float, default=0.05, help='Lower bound for verify_thresh_multi search.')
-    parser.add_argument('--bayes_multi_max', type=float, default=0.9, help='Upper bound for verify_thresh_multi search.')
-    parser.add_argument('--bayes_tokens_per_trial', type=int, default=50, help='Minimum tokens aggregated per trial for latency averaging.')
+    parser.add_argument('--bayes_only', action='store_true', help='Run BO and exit without formal evaluation.')
+    parser.add_argument('--bayes_calls', type=int, default=16, help='Total BO samples (16 in the paper).')
+    parser.add_argument('--bayes_init_points', type=int, default=1, help='Random initial samples (one in the paper).')
+    parser.add_argument('--bayes_single_min', type=float, default=1e-6, help='Lower bound for R2 search.')
+    parser.add_argument('--bayes_single_max', type=float, default=1.0, help='Upper bound for R2 search.')
+    parser.add_argument('--bayes_multi_min', type=float, default=1e-6, help='Lower bound for R1 search.')
+    parser.add_argument('--bayes_multi_max', type=float, default=1.0, help='Upper bound for R1 search.')
+    parser.add_argument('--bayes_tokens_per_trial', type=int, default=20, help='Accepted tokens measured per BO sample.')
+    parser.add_argument('--bayes_ei_xi', type=float, default=0.1, help='Expected-improvement exploration parameter.')
     parser.add_argument('--init_alpha', type=float, default=0.92, help='Initial alpha value for some parameter.')
     parser.add_argument('--multiply_times', type=float, default=0.95, help='Decay rate for alpha parameter.')
     parser.add_argument('--init_rtt', type=float, default=0.05, help='Initial RTT estimate in seconds used by the bandwidth limiter.')
@@ -73,6 +75,15 @@ def parse_arguments():
     parser.add_argument('--edgeLLM', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--default_token_compute', type=float, default=0.036, help='Default single-token compute time used for planning.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
+    parser.add_argument('--schedule_window', type=int, default=20, help='Initial DP scheduling window N-hat.')
+    parser.add_argument('--schedule_history_size', type=int, default=100, help='Draft sequences used for moving-average N-hat.')
+    parser.add_argument('--environment_update_threshold', type=float, default=0.2, help='Relative change needed to update DP/BO.')
+    parser.add_argument('--regression_min_comm_samples', type=int, default=8, help='Minimum communication samples before alpha/beta regression.')
+    parser.add_argument(
+        '--disable_online_environment_measurement',
+        action='store_true',
+        help='Disable online alpha/beta/gamma measurement updates for DP scheduling.',
+    )
     parser.add_argument(
         '--merge_policy',
         type=str,

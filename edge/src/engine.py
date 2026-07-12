@@ -7,11 +7,12 @@ transformers.utils.logging.set_verbosity(40)
 warnings.filterwarnings("ignore")
 from abc import ABC, abstractmethod
 from .util import seed_everything, softmax, strategy2exp
-from .merge import dynamic_token_scheduling_dp
+from .merge import OnlineEnvironmentEstimator, PaperDPScheduler
 import time
 import numpy as np
 from typing import List, Dict, Tuple
 import msgpack
+import threading
 from .comm import BandwidthSender
 # For GGUF model support
 try:
@@ -79,6 +80,20 @@ class Decoding(ABC):
         self._token_durations: List[float] = []
         self.process_started_at: float = time.time()
         self.process_model_ready_at: float = self.process_started_at
+        self.online_environment_measurement = not getattr(self.args, "disable_online_environment_measurement", False)
+        self._environment_lock = threading.Lock()
+        self.environment_estimator = OnlineEnvironmentEstimator(
+            history_size=getattr(self.args, "schedule_history_size", 100),
+            min_comm_samples=getattr(self.args, "regression_min_comm_samples", 8),
+        )
+        self.dp_scheduler = PaperDPScheduler(
+            alpha=self.C,
+            beta=(self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
+            gamma=self.args.default_token_compute,
+            initial_window=getattr(self.args, "schedule_window", 20),
+            history_size=getattr(self.args, "schedule_history_size", 100),
+            update_threshold=getattr(self.args, "environment_update_threshold", 0.2),
+        )
         # self.exp_name = strategy2exp(self.verify_strategy)
         self.exp_name = os.path.join(os.getcwd(), 'exp', "exp__wjl", self.args.dataset, self.algorithm)
         print(self.exp_name)
@@ -123,6 +138,7 @@ class Decoding(ABC):
             base_latency=self.C,
             timeout=getattr(self.args, "server_timeout_s", 10),
             use_env_proxy=getattr(self.args, "use_env_proxy", False),
+            on_complete=self._on_send_measurement if self.online_environment_measurement else None,
         )
 
     def _resolve_merge_plan(self) -> List[int]:
@@ -131,12 +147,43 @@ class Decoding(ABC):
         if self.merge_policy == "no_early":
             return [100]
 
-        batches, _ = dynamic_token_scheduling_dp(
-            [self.args.default_token_compute] * self.gamma,
-            self.C,
-            (self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
-        )
-        return [len(batch) for batch in batches if batch] or [self.gamma * 4]
+        with self._environment_lock:
+            return self.dp_scheduler.plan()
+
+    def _observe_completed_draft_round(self, draft_length: int) -> None:
+        if self.merge_policy == "dp":
+            with self._environment_lock:
+                self.dp_scheduler.observe_draft_length(draft_length)
+
+    def _on_send_measurement(self, measurement: Dict[str, object]) -> None:
+        if not self.online_environment_measurement or not measurement.get("success"):
+            return
+        token_count = measurement.get("token_count")
+        elapsed_seconds = measurement.get("elapsed_seconds")
+        if token_count is None or elapsed_seconds is None:
+            return
+        with self._environment_lock:
+            self.environment_estimator.observe_communication(int(token_count), float(elapsed_seconds))
+            estimates = self.environment_estimator.estimate()
+            if estimates:
+                self.dp_scheduler.update_parameters(**estimates)
+
+    def _observe_generation_time(self, token_count: int, elapsed_seconds: float) -> None:
+        if not self.online_environment_measurement:
+            return
+        with self._environment_lock:
+            self.environment_estimator.observe_generation(token_count, elapsed_seconds)
+            estimates = self.environment_estimator.estimate()
+            if estimates:
+                self.dp_scheduler.update_parameters(**estimates)
+
+    def _environment_snapshot(self) -> Dict[str, object]:
+        with self._environment_lock:
+            return {
+                "online_measurement_enabled": self.online_environment_measurement,
+                "estimator": self.environment_estimator.snapshot(),
+                "dp_scheduler": self.dp_scheduler.snapshot(),
+            }
 
     def _record_token_time(self, token_count: int) -> None:
         if token_count <= 0:
@@ -301,7 +348,7 @@ class Decoding(ABC):
 
         return saved_path
     
-    def edge_process_draft_model(self, prefix, task_id):
+    def edge_process_draft_model(self, prefix, task_id, persist_result: bool = True):
         """
         [最终修正 & 多任务版] 边缘端工作进程。
         一个一个生成token，满足发送条件就发送，满足验证条件时验证。
@@ -377,6 +424,7 @@ class Decoding(ABC):
             eval_time = end_eval - start_eval
             if eval_time < self.args.default_token_compute:
                 time.sleep(self.args.default_token_compute - eval_time)
+            self._observe_generation_time(1, time.time() - start_eval)
             
             # 获取概率分布
             
@@ -419,7 +467,11 @@ class Decoding(ABC):
 
                 # print(f"[DEBUG] 发送验证请求，tokens: {current_batch_tokens}, n_past: {current_n_past}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
 
-                future = self.sender.submit(PROPOSE_ENDPOINT, payload_bytes, headers={"Content-Type": "application/msgpack"})
+                future = self.sender.submit(
+                    PROPOSE_ENDPOINT,
+                    payload_bytes,
+                    headers={"Content-Type": "application/msgpack"},
+                )
                 verify_result = None
                 
                 # --- 3. 在等待验证结果期间继续生成token ---
@@ -448,7 +500,12 @@ class Decoding(ABC):
                     self._spec_token_indices_generated.append(self.num_spec_tokens_generated)
                     
                     # eval这个等待token
+                    wait_eval_start = time.time()
                     self.draft_model.eval([wait_token])
+                    wait_eval_time = time.time() - wait_eval_start
+                    if wait_eval_time < self.args.default_token_compute:
+                        time.sleep(self.args.default_token_compute - wait_eval_time)
+                    self._observe_generation_time(1, time.time() - wait_eval_start)
                     
                     waiting_tokens.append(wait_token)
                     waiting_probs.append(wait_probs)
@@ -494,6 +551,7 @@ class Decoding(ABC):
                         waiting_payload_bytes,
                         headers={"Content-Type": "application/msgpack"},
                         tag=waiting_tag,
+                        token_count=None if should_verify_waiting else 1,
                     )
                     waiting_futures.append(waiting_future)
                     if should_verify_waiting:
@@ -517,6 +575,8 @@ class Decoding(ABC):
                 self.verify_spec_lengths.append(len(total_speculative_tokens))
                 self.verify_accept_lengths.append(n_accepted)
                 self.verify_his.append((len(total_speculative_tokens), n_accepted))
+                self._observe_completed_draft_round(len(total_speculative_tokens))
+                merge_plan_batches = self._resolve_merge_plan()
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
@@ -628,6 +688,8 @@ class Decoding(ABC):
                         self.verify_spec_lengths.append(waiting_spec_len)
                         self.verify_accept_lengths.append(n_accepted_waiting)
                         self.verify_his.append((waiting_spec_len, n_accepted_waiting))
+                        self._observe_completed_draft_round(waiting_spec_len)
+                        merge_plan_batches = self._resolve_merge_plan()
                         if waiting_spec_len > 0:
                             self.acc_ratio += n_accepted_waiting / waiting_spec_len
                         accepted_waiting_tokens = waiting_tokens[:n_accepted_waiting] if waiting_tokens else []
@@ -676,7 +738,12 @@ class Decoding(ABC):
                 # print(f"[DEBUG] 发送批次请求，tokens: {current_batch_tokens}, n_past: {current_n_past}, index: {len(total_speculative_tokens)}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
                 # print(f"[发送] 当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}")
 
-                future = self.sender.submit(PROPOSE_ENDPOINT, payload_bytes, headers={"Content-Type": "application/msgpack"})
+                future = self.sender.submit(
+                    PROPOSE_ENDPOINT,
+                    payload_bytes,
+                    headers={"Content-Type": "application/msgpack"},
+                    token_count=len(current_batch_tokens),
+                )
 
                 # 重置当前批次
                 current_batch_tokens = []
@@ -740,7 +807,12 @@ class Decoding(ABC):
             'verify_accept_lengths': self.verify_accept_lengths,
             'verify_his': self.verify_his,
             'diagnostics': diagnostics,
+            'environment_measurements': self._environment_snapshot(),
         }
+        if not persist_result:
+            self.sender.close()
+            return _json_safe(exp_result)
+
         # 读取已有数据
         if os.path.exists(saved_path):
             with open(saved_path, 'r', encoding='utf-8') as f:

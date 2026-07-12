@@ -120,6 +120,11 @@ def make_args(**overrides):
         nomerge=False,
         default_token_compute=0.036,
         token_size_MB=0.29,
+        schedule_window=20,
+        schedule_history_size=100,
+        environment_update_threshold=0.2,
+        regression_min_comm_samples=8,
+        disable_online_environment_measurement=False,
         merge_policy="dp",
         result_tag="",
         task_id_offset=0,
@@ -227,6 +232,13 @@ class RunEdgeTests(unittest.TestCase):
         merge_plan = decoder._resolve_merge_plan()
 
         self.assertEqual(merge_plan, [1] * 40)
+
+    def test_resolve_merge_plan_uses_paper_scheduling_window(self):
+        decoder = DummyDecoding(make_args(algorithm="pipesd", verify_strategy="hybrid"))
+
+        merge_plan = decoder._resolve_merge_plan()
+
+        self.assertEqual(sum(merge_plan), 20)
 
     def test_exp2path_distinguishes_pipesd_merge_policy(self):
         decoder = DummyDecoding(

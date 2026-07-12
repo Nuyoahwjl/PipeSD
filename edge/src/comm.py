@@ -6,7 +6,7 @@ import requests
 import concurrent.futures
 import collections
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 @dataclass
@@ -16,6 +16,7 @@ class PendingRequest:
     payload: Any
     headers: Dict[str, str]
     future: concurrent.futures.Future
+    token_count: Optional[int] = None
     cancelled: bool = False
     inflight: bool = False  # 标记是否已被工作线程取出并开始发送
 
@@ -36,12 +37,14 @@ class BandwidthSender:
         base_latency: float = 0.0,
         timeout: int = 10,
         use_env_proxy: bool = False,
+        on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._q = queue.Queue()
         self._bandwidth_bytes = bandwidth_MBps * 1_000_000
         self._base_latency = base_latency
         self._timeout = timeout
         self._use_env_proxy = use_env_proxy
+        self._on_complete = on_complete
         self._lock = threading.Lock()
         self._pending_requests = collections.defaultdict(collections.deque)
         self._tag_futures = collections.defaultdict(list)
@@ -53,9 +56,16 @@ class BandwidthSender:
         with self._lock:
             self._bandwidth_bytes = bandwidth_MBps * 1_000_000
 
-    def submit(self, url, payload, headers=None, tag=None):
+    def submit(self, url, payload, headers=None, tag=None, token_count=None):
         fut = concurrent.futures.Future()
-        request = PendingRequest(tag=tag, url=url, payload=payload, headers=headers or {}, future=fut)
+        request = PendingRequest(
+            tag=tag,
+            url=url,
+            payload=payload,
+            headers=headers or {},
+            future=fut,
+            token_count=token_count,
+        )
         with self._lock:
             self._future_to_request[fut] = request
             if tag is not None:
@@ -175,6 +185,21 @@ class BandwidthSender:
                         self._tag_futures.pop(tag, None)
             self._future_to_request.pop(request.future, None)
 
+    def _notify_complete(self, request: PendingRequest, started_at: float, finished_at: float, success: bool):
+        if self._on_complete is None:
+            return
+        try:
+            self._on_complete({
+                "tag": request.tag,
+                "url": request.url,
+                "payload_size": request.payload_size,
+                "token_count": request.token_count,
+                "elapsed_seconds": max(0.0, finished_at - started_at),
+                "success": success,
+            })
+        except Exception:
+            pass
+
     def _worker(self):
         session = requests.Session()
         session.trust_env = self._use_env_proxy
@@ -200,6 +225,8 @@ class BandwidthSender:
                 with self._lock:
                     now = time.monotonic()
 
+                started_at = time.monotonic()
+                success = False
                 try:
                     if isinstance(request.payload, (bytes, bytearray)):
                         resp = session.post(
@@ -223,6 +250,7 @@ class BandwidthSender:
                     after = time.monotonic()
                     if after - now < quota:
                         time.sleep(quota - (after - now))
+                    success = True
                     if not request.future.cancelled():
                         request.future.set_result(
                             resp.json()
@@ -233,6 +261,7 @@ class BandwidthSender:
                     if not request.future.cancelled():
                         request.future.set_exception(exc)
                 finally:
+                    self._notify_complete(request, started_at, time.monotonic(), success)
                     self._release_pending(request)
         finally:
             session.close()

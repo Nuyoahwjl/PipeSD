@@ -22,7 +22,7 @@ except ImportError:
 
 # 配置
 APP_PORT = 8000
-POWER_SAMPLE_INTERVAL = float(os.environ.get("GPU_POWER_SAMPLE_INTERVAL", 0.01))
+POWER_SAMPLE_INTERVAL = float(os.environ.get("GPU_POWER_SAMPLE_INTERVAL", 0.005))
 
 app = FastAPI(title="Speculative Decoding Communication Gateway")
 

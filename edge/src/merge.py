@@ -1,5 +1,6 @@
 import sys
-from typing import List, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 
 def dynamic_token_scheduling_dp(
@@ -71,6 +72,118 @@ def dynamic_token_scheduling_dp(
         print(f"[DP] batches: {batches}, min completion time: {min_completion_time:.6f}")
 
     return batches, min_completion_time
+
+
+class PaperDPScheduler:
+    """Online scheduler matching Algorithm 1 and Appendix D.2 of PipeSD."""
+
+    def __init__(self, alpha: float, beta: float, gamma: float, initial_window: int = 20,
+                 history_size: int = 100, update_threshold: float = 0.2) -> None:
+        if initial_window <= 0 or history_size <= 0:
+            raise ValueError("window sizes must be positive")
+        self.alpha, self.beta, self.gamma = float(alpha), float(beta), float(gamma)
+        self.window = int(initial_window)
+        self.update_threshold = float(update_threshold)
+        self.draft_lengths: Deque[int] = deque(maxlen=history_size)
+        self._plan: Optional[List[int]] = None
+
+    @staticmethod
+    def _relative_change(old: float, new: float) -> float:
+        return (0.0 if new == 0 else float("inf")) if old == 0 else abs(new - old) / abs(old)
+
+    def observe_draft_length(self, length: int) -> bool:
+        if length <= 0:
+            return False
+        self.draft_lengths.append(int(length))
+        new_window = max(1, int(round(sum(self.draft_lengths) / len(self.draft_lengths))))
+        if new_window == self.window:
+            return False
+        self.window, self._plan = new_window, None
+        return True
+
+    def update_parameters(self, *, alpha: Optional[float] = None,
+                          beta: Optional[float] = None,
+                          gamma: Optional[float] = None) -> bool:
+        proposed = {"alpha": self.alpha if alpha is None else float(alpha),
+                    "beta": self.beta if beta is None else float(beta),
+                    "gamma": self.gamma if gamma is None else float(gamma)}
+        changed = any(self._relative_change(getattr(self, name), value) > self.update_threshold
+                      for name, value in proposed.items())
+        if changed:
+            self.alpha, self.beta, self.gamma = proposed["alpha"], proposed["beta"], proposed["gamma"]
+            self._plan = None
+        return changed
+
+    def plan(self) -> List[int]:
+        if self._plan is None:
+            batches, _ = dynamic_token_scheduling_dp([self.gamma] * self.window,
+                                                      self.alpha, self.beta)
+            self._plan = [len(batch) for batch in batches if batch] or [self.window]
+        return list(self._plan)
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "window": self.window,
+            "plan": self.plan(),
+            "draft_length_history_size": len(self.draft_lengths),
+        }
+
+
+class OnlineEnvironmentEstimator:
+    """Estimate PipeSD DP parameters from recent runtime measurements."""
+
+    def __init__(self, history_size: int = 100, min_comm_samples: int = 8) -> None:
+        if history_size <= 0:
+            raise ValueError("history_size must be positive")
+        if min_comm_samples <= 1:
+            raise ValueError("min_comm_samples must be greater than 1")
+        self.min_comm_samples = int(min_comm_samples)
+        self.comm_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
+        self.generation_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
+
+    def observe_communication(self, token_count: int, elapsed_seconds: float) -> None:
+        if token_count <= 0 or elapsed_seconds <= 0:
+            return
+        self.comm_samples.append((int(token_count), float(elapsed_seconds)))
+
+    def observe_generation(self, token_count: int, elapsed_seconds: float) -> None:
+        if token_count <= 0 or elapsed_seconds <= 0:
+            return
+        self.generation_samples.append((int(token_count), float(elapsed_seconds)))
+
+    def estimate(self) -> Dict[str, float]:
+        estimates: Dict[str, float] = {}
+        comm = list(self.comm_samples)
+        if len(comm) >= self.min_comm_samples and len({count for count, _ in comm}) >= 2:
+            n = float(len(comm))
+            sum_x = sum(float(count) for count, _ in comm)
+            sum_y = sum(elapsed for _, elapsed in comm)
+            sum_xx = sum(float(count * count) for count, _ in comm)
+            sum_xy = sum(float(count) * elapsed for count, elapsed in comm)
+            denominator = n * sum_xx - sum_x * sum_x
+            if denominator > 0:
+                beta = (n * sum_xy - sum_x * sum_y) / denominator
+                alpha = (sum_y - beta * sum_x) / n
+                estimates["alpha"] = max(0.0, alpha)
+                estimates["beta"] = max(1e-9, beta)
+
+        total_generated_tokens = sum(count for count, _ in self.generation_samples)
+        total_generation_time = sum(elapsed for _, elapsed in self.generation_samples)
+        if total_generated_tokens > 0 and total_generation_time > 0:
+            estimates["gamma"] = total_generation_time / total_generated_tokens
+
+        return estimates
+
+    def snapshot(self) -> Dict[str, object]:
+        return {
+            "comm_samples": len(self.comm_samples),
+            "generation_samples": len(self.generation_samples),
+            "min_comm_samples": self.min_comm_samples,
+            "estimate": self.estimate(),
+        }
 
 
 def baseline_full_merge(token_compute_times: List[float], C: float, d: float) -> float:

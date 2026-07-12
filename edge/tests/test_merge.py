@@ -30,6 +30,45 @@ class MergeModuleTests(unittest.TestCase):
             if previous_pandas is not None:
                 sys.modules["pandas"] = previous_pandas
 
+    def test_paper_scheduler_starts_with_twenty_token_window(self):
+        from src.merge import PaperDPScheduler
+
+        scheduler = PaperDPScheduler(alpha=0.02, beta=0.01, gamma=0.03)
+
+        self.assertEqual(sum(scheduler.plan()), 20)
+
+    def test_paper_scheduler_updates_window_from_recent_draft_lengths(self):
+        from src.merge import PaperDPScheduler
+
+        scheduler = PaperDPScheduler(alpha=0.02, beta=0.01, gamma=0.03)
+        scheduler.observe_draft_length(4)
+        scheduler.observe_draft_length(6)
+
+        self.assertEqual(scheduler.window, 5)
+        self.assertEqual(sum(scheduler.plan()), 5)
+
+    def test_paper_scheduler_uses_twenty_percent_parameter_gate(self):
+        from src.merge import PaperDPScheduler
+
+        scheduler = PaperDPScheduler(alpha=1.0, beta=1.0, gamma=1.0)
+
+        self.assertFalse(scheduler.update_parameters(alpha=1.2))
+        self.assertTrue(scheduler.update_parameters(alpha=1.21))
+
+    def test_online_environment_estimator_regresses_comm_and_generation(self):
+        from src.merge import OnlineEnvironmentEstimator
+
+        estimator = OnlineEnvironmentEstimator(history_size=100, min_comm_samples=2)
+        estimator.observe_communication(1, 0.15)
+        estimator.observe_communication(3, 0.35)
+        estimator.observe_generation(2, 0.08)
+
+        estimates = estimator.estimate()
+
+        self.assertAlmostEqual(estimates["alpha"], 0.05, places=6)
+        self.assertAlmostEqual(estimates["beta"], 0.1, places=6)
+        self.assertAlmostEqual(estimates["gamma"], 0.04, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()
