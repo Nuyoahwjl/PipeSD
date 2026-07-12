@@ -133,17 +133,19 @@ class CloudEdgeSpeculativeEval(Decoding):
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
     def _run_latency_trial(self, thresh_single: float, thresh_multi: float, min_tokens: int):
-        latencies = []
+        # BO candidates must be evaluated independently.  Formal evaluation
+        # intentionally keeps cumulative token durations, so reset the shared
+        # buffer only at the BO-trial boundary.
+        self._token_durations = []
         samples_iter = itertools.cycle(self.samples)
         self.args.verify_thresh_single = thresh_single
         self.args.verify_thresh_multi = thresh_multi
-        while len(latencies) < min_tokens:
+        while len(self._token_durations) < min_tokens:
             sample = next(samples_iter)
             prompt, task_id = self.preprocess(sample)
             self._reset_state()
             self.edge_process_draft_model(prompt, task_id, persist_result=False)
-            latencies.extend(self._token_durations)
-        return latencies
+        return list(self._token_durations)
 
     def bayes_optimize_thresholds(self):
         try:

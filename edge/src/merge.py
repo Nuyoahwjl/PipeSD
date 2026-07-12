@@ -141,6 +141,7 @@ class OnlineEnvironmentEstimator:
         if min_comm_samples <= 1:
             raise ValueError("min_comm_samples must be greater than 1")
         self.min_comm_samples = int(min_comm_samples)
+        self.history_size = int(history_size)
         self.comm_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
         self.generation_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
 
@@ -154,10 +155,22 @@ class OnlineEnvironmentEstimator:
             return
         self.generation_samples.append((int(token_count), float(elapsed_seconds)))
 
+    def missing_batch_sizes(self, required_sizes) -> List[int]:
+        observed = {count for count, _ in self.comm_samples}
+        return [int(size) for size in required_sizes if int(size) not in observed]
+
     def estimate(self) -> Dict[str, float]:
         estimates: Dict[str, float] = {}
-        comm = list(self.comm_samples)
-        if len(comm) >= self.min_comm_samples and len({count for count, _ in comm}) >= 2:
+        raw_comm = list(self.comm_samples)
+        grouped: Dict[int, List[float]] = {}
+        for count, elapsed in raw_comm:
+            grouped.setdefault(count, []).append(elapsed)
+        comm = [
+            (count, sum(elapsed_values) / len(elapsed_values))
+            for count, elapsed_values in sorted(grouped.items())
+        ]
+        required_distinct_sizes = min(self.min_comm_samples, 8)
+        if len(raw_comm) >= self.min_comm_samples and len(comm) >= required_distinct_sizes:
             n = float(len(comm))
             sum_x = sum(float(count) for count, _ in comm)
             sum_y = sum(elapsed for _, elapsed in comm)
@@ -181,6 +194,7 @@ class OnlineEnvironmentEstimator:
         return {
             "comm_samples": len(self.comm_samples),
             "generation_samples": len(self.generation_samples),
+            "distinct_comm_batch_sizes": sorted({count for count, _ in self.comm_samples}),
             "min_comm_samples": self.min_comm_samples,
             "estimate": self.estimate(),
         }

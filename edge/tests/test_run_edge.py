@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+import concurrent.futures
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -66,6 +67,25 @@ class FakeSender:
     def __init__(self, *args, **kwargs):
         self.args = args
         self.kwargs = kwargs
+
+
+class BootstrapSender(FakeSender):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.submissions = []
+
+    def submit(self, url, payload, headers=None, tag=None, token_count=None):
+        self.submissions.append((url, payload, token_count))
+        callback = self.kwargs.get("on_complete")
+        if callback is not None:
+            callback({
+                "success": True,
+                "token_count": token_count,
+                "elapsed_seconds": 0.05 + 0.01 * token_count,
+            })
+        future = concurrent.futures.Future()
+        future.set_result({"body_size_bytes": len(payload)})
+        return future
 
 
 class FakeLlama:
@@ -135,6 +155,24 @@ def make_args(**overrides):
 
 
 class RunEdgeTests(unittest.TestCase):
+    def test_bayes_latency_trial_does_not_reuse_previous_candidate_tokens(self):
+        evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+        evaluator.samples = ["sample"]
+        evaluator.args = SimpleNamespace(verify_thresh_single=0.0, verify_thresh_multi=0.0)
+        evaluator._token_durations = [99.0]
+        evaluator.preprocess = lambda sample: (sample, 0)
+        evaluator._reset_state = lambda: None
+
+        def run_sample(*args, **kwargs):
+            evaluator._token_durations.extend([0.1] * 25)
+
+        evaluator.edge_process_draft_model = run_sample
+
+        latencies = evaluator._run_latency_trial(0.4, 0.6, min_tokens=20)
+
+        self.assertEqual(latencies, [0.1] * 25)
+        self.assertNotIn(99.0, latencies)
+
     def test_load_data_respects_max_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             data_path = Path(tmpdir) / "gsm8k.jsonl"
@@ -225,6 +263,24 @@ class RunEdgeTests(unittest.TestCase):
 
         self.assertEqual(decoder._token_durations, [2.0, 2.0, 2.0])
         self.assertEqual(decoder._token_time_ref, 106.0)
+
+    def test_pipesd_bootstraps_communication_with_batch_sizes_one_to_eight(self):
+        args = make_args(
+            algorithm="pipesd",
+            verify_strategy="hybrid",
+            token_size_MB=0.000001,
+        )
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch("src.engine.BandwidthSender", BootstrapSender):
+            decoder._reset_state()
+
+        self.assertEqual([item[2] for item in decoder.sender.submissions], list(range(1, 9)))
+        self.assertEqual([len(item[1]) for item in decoder.sender.submissions], list(range(1, 9)))
+        estimates = decoder.environment_estimator.estimate()
+        self.assertAlmostEqual(estimates["alpha"], 0.05, places=6)
+        self.assertAlmostEqual(estimates["beta"], 0.01, places=6)
 
     def test_resolve_merge_plan_supports_immediate_policy(self):
         decoder = DummyDecoding(make_args(algorithm="pipesd", verify_strategy="hybrid", merge_policy="immediate"))

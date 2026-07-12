@@ -34,6 +34,7 @@ URL = resolve_server_url()
 INIT_ENDPOINT = f"{URL}/init"
 PROPOSE_ENDPOINT = f"{URL}/propose"
 EXIT_ENDPOINT = f"{URL}/exit"
+DELAY_ENDPOINT = f"{URL}/delay"
 
 max_probs = []
 
@@ -82,6 +83,7 @@ class Decoding(ABC):
         self.process_model_ready_at: float = self.process_started_at
         self.online_environment_measurement = not getattr(self.args, "disable_online_environment_measurement", False)
         self._environment_lock = threading.Lock()
+        self._bootstrap_lock = threading.Lock()
         self.environment_estimator = OnlineEnvironmentEstimator(
             history_size=getattr(self.args, "schedule_history_size", 100),
             min_comm_samples=getattr(self.args, "regression_min_comm_samples", 8),
@@ -140,6 +142,38 @@ class Decoding(ABC):
             use_env_proxy=getattr(self.args, "use_env_proxy", False),
             on_complete=self._on_send_measurement if self.online_environment_measurement else None,
         )
+        if self.online_environment_measurement and self._uses_dp_scheduler():
+            self._ensure_communication_bootstrap(force_initial=True)
+            self._token_time_ref = time.time()
+
+    def _uses_dp_scheduler(self) -> bool:
+        return self.merge_policy == "dp" and ("pipesd" in self.algorithm or "merge" in self.algorithm)
+
+    def _ensure_communication_bootstrap(self, force_initial: bool = False) -> None:
+        """Collect the paper's 1--8 token-batch communication probes."""
+        if not self.online_environment_measurement or not self._uses_dp_scheduler() or not hasattr(self, "sender"):
+            return
+        with self._bootstrap_lock:
+            with self._environment_lock:
+                sample_count = len(self.environment_estimator.comm_samples)
+                missing_sizes = self.environment_estimator.missing_batch_sizes(range(1, 9))
+                history_full = sample_count >= self.environment_estimator.history_size
+            if force_initial and sample_count > 0:
+                force_initial = False
+            if not missing_sizes or (not force_initial and not history_full):
+                return
+
+            bytes_per_token = max(1, int(round(self.args.token_size_MB * 1_000_000)))
+            for batch_size in missing_sizes:
+                payload = bytes(bytes_per_token * batch_size)
+                future = self.sender.submit(
+                    DELAY_ENDPOINT,
+                    payload,
+                    headers={"Content-Type": "application/octet-stream"},
+                    tag=f"comm-bootstrap-{batch_size}",
+                    token_count=batch_size,
+                )
+                future.result()
 
     def _resolve_merge_plan(self) -> List[int]:
         if self.merge_policy == "immediate":
@@ -147,6 +181,7 @@ class Decoding(ABC):
         if self.merge_policy == "no_early":
             return [100]
 
+        self._ensure_communication_bootstrap()
         with self._environment_lock:
             return self.dp_scheduler.plan()
 

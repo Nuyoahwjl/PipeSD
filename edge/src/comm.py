@@ -227,6 +227,7 @@ class BandwidthSender:
 
                 started_at = time.monotonic()
                 success = False
+                completion_notified = False
                 try:
                     if isinstance(request.payload, (bytes, bytearray)):
                         resp = session.post(
@@ -251,6 +252,8 @@ class BandwidthSender:
                     if after - now < quota:
                         time.sleep(quota - (after - now))
                     success = True
+                    self._notify_complete(request, started_at, time.monotonic(), success)
+                    completion_notified = True
                     if not request.future.cancelled():
                         request.future.set_result(
                             resp.json()
@@ -261,7 +264,8 @@ class BandwidthSender:
                     if not request.future.cancelled():
                         request.future.set_exception(exc)
                 finally:
-                    self._notify_complete(request, started_at, time.monotonic(), success)
+                    if not completion_notified:
+                        self._notify_complete(request, started_at, time.monotonic(), success)
                     self._release_pending(request)
         finally:
             session.close()

@@ -69,6 +69,15 @@ class MergeModuleTests(unittest.TestCase):
         self.assertAlmostEqual(estimates["beta"], 0.1, places=6)
         self.assertAlmostEqual(estimates["gamma"], 0.04, places=6)
 
+    def test_online_environment_estimator_reports_missing_bootstrap_sizes(self):
+        from src.merge import OnlineEnvironmentEstimator
+
+        estimator = OnlineEnvironmentEstimator(history_size=100, min_comm_samples=8)
+        estimator.observe_communication(1, 0.1)
+        estimator.observe_communication(3, 0.3)
+
+        self.assertEqual(estimator.missing_batch_sizes(range(1, 9)), [2, 4, 5, 6, 7, 8])
+
 
 if __name__ == "__main__":
     unittest.main()
