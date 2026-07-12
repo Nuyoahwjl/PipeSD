@@ -43,7 +43,7 @@ def parse_arguments():
     # parser.add_argument('--dataset', type=str, default="gsm8k")
     parser.add_argument('--exp_name', '-e', type=str, default="exp_fixednum", help='folder name for storing results.')
     parser.add_argument('--seed', '-s', type=int, default=1234, help='set a random seed, which can makes the result reproducible')
-    parser.add_argument('--max_generated_tokens', type=int, default=128, help='max token number generated.')
+    parser.add_argument('--max_generated_tokens', type=int, default=1024, help='max token number generated.')
     parser.add_argument('--temp', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=1, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')

@@ -9,7 +9,7 @@ from typing import Dict, List
 import requests
 
 
-DEFAULT_URL = os.getenv("EDGE_HEALTH_URL", "http://115.190.90.101:1597/delay")
+DEFAULT_URL = os.getenv("EDGE_HEALTH_URL", "http://127.0.0.1:8000/health")
 # DEFAULT_URL = os.getenv("EDGE_HEALTH_URL", "http://i-2.gpushare.com:55057/health")
 
 

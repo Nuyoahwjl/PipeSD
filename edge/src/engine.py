@@ -23,7 +23,7 @@ except ImportError:
 
 # ========== 配置 ==========
 def resolve_server_url() -> str:
-    return os.getenv("PIPE_SD_SERVER_URL", "http://115.190.90.101:1597")
+    return os.getenv("PIPE_SD_SERVER_URL", "http://127.0.0.1:8000")
 
 
 # URL = "http://39.102.209.27:6001"  # 你的云端 FastAPI 地址
@@ -35,6 +35,17 @@ PROPOSE_ENDPOINT = f"{URL}/propose"
 EXIT_ENDPOINT = f"{URL}/exit"
 
 max_probs = []
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 class Decoding(ABC):
     def __init__(self, args):
@@ -623,9 +634,11 @@ class Decoding(ABC):
                         output_tokens.extend(accepted_waiting_tokens)
                         output_tokens.append(final_token_waiting)
                         self._record_token_time(len(accepted_waiting_tokens) + 1)
-                        self.draft_model.n_tokens = current_n_past + n_accepted_waiting
-                        # print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted_waiting: {n_accepted_waiting}')
-                        self.draft_model.eval([final_token_waiting])
+                        # The waiting branch may have advanced llama.cpp's KV cache beyond
+                        # the accepted prefix. Rebuild from the committed output to keep
+                        # n_tokens and the internal cache consistent before continuing.
+                        self.draft_model.reset()
+                        self.draft_model.eval(output_tokens)
                         current_n_past = self.draft_model.n_tokens
                         # print(f"[DEBUG] 重构批次全部接受，更新状态: n_past {current_n_past - n_accepted_waiting - 1} -> {current_n_past}, final_token {final_token_waiting}")
                         if self.verify_strategy == 'multiple-tokens':
@@ -739,7 +752,7 @@ class Decoding(ABC):
             data = []
 
         # 添加新结果
-        data.append(exp_result)
+        data.append(_json_safe(exp_result))
 
         # 写回整个文件
         with open(saved_path, 'w', encoding='utf-8') as f:
