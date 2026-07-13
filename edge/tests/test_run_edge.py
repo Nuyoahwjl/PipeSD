@@ -163,15 +163,42 @@ class RunEdgeTests(unittest.TestCase):
         evaluator.preprocess = lambda sample: (sample, 0)
         evaluator._reset_state = lambda: None
 
+        observed_budgets = []
+
         def run_sample(*args, **kwargs):
-            evaluator._token_durations.extend([0.1] * 25)
+            budget = kwargs["max_accepted_tokens"]
+            observed_budgets.append(budget)
+            evaluator._token_durations.extend([0.1] * budget)
 
         evaluator.edge_process_draft_model = run_sample
 
-        latencies = evaluator._run_latency_trial(0.4, 0.6, min_tokens=20)
+        latencies = evaluator._run_latency_trial(0.4, 0.6, tokens_per_sample=20)
 
-        self.assertEqual(latencies, [0.1] * 25)
+        self.assertEqual(latencies, [0.1] * 20)
+        self.assertEqual(observed_budgets, [20])
         self.assertNotIn(99.0, latencies)
+
+    def test_bayes_latency_trial_collects_twenty_tokens_from_each_of_ten_samples(self):
+        evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+        evaluator.samples = list(range(10))
+        evaluator.args = SimpleNamespace(verify_thresh_single=0.0, verify_thresh_multi=0.0)
+        evaluator._token_durations = []
+        evaluator.preprocess = lambda sample: (f"prompt-{sample}", sample)
+        evaluator._reset_state = lambda: None
+        observed = []
+
+        def run_sample(prompt, task_id, **kwargs):
+            budget = kwargs["max_accepted_tokens"]
+            observed.append((prompt, task_id, budget))
+            evaluator._token_durations.extend([0.1] * budget)
+
+        evaluator.edge_process_draft_model = run_sample
+
+        latencies = evaluator._run_latency_trial(0.4, 0.6, tokens_per_sample=20)
+
+        self.assertEqual(len(latencies), 200)
+        self.assertEqual([item[1] for item in observed], list(range(10)))
+        self.assertEqual([item[2] for item in observed], [20] * 10)
 
     def test_load_data_respects_max_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -263,6 +290,33 @@ class RunEdgeTests(unittest.TestCase):
 
         self.assertEqual(decoder._token_durations, [2.0, 2.0, 2.0])
         self.assertEqual(decoder._token_time_ref, 106.0)
+
+    def test_commit_verified_tokens_respects_remaining_generation_budget(self):
+        decoder = DummyDecoding(make_args())
+        decoder.max_len = 6
+        decoder._token_durations = []
+        decoder._token_time_ref = 100.0
+        output_tokens = [10, 11, 12, 13]
+
+        with mock.patch("src.engine.time.time", return_value=102.0):
+            committed = decoder._commit_verified_tokens(
+                output_tokens,
+                speculative_tokens=[20, 21, 22],
+                n_accepted=3,
+                final_token=30,
+            )
+
+        self.assertEqual(committed, 2)
+        self.assertEqual(output_tokens, [10, 11, 12, 13, 20, 21])
+        self.assertEqual(len(decoder._token_durations), 2)
+
+    def test_generation_budget_forces_verification_before_final_token_slot(self):
+        decoder = DummyDecoding(make_args())
+        decoder.max_len = 6
+
+        self.assertFalse(decoder._must_verify_for_budget([1, 2, 3, 4], []))
+        self.assertTrue(decoder._must_verify_for_budget([1, 2, 3, 4], [5]))
+        self.assertTrue(decoder._must_verify_for_budget([1, 2, 3], [4], [5]))
 
     def test_pipesd_bootstraps_communication_with_batch_sizes_one_to_eight(self):
         args = make_args(

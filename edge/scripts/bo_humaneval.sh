@@ -23,7 +23,7 @@ cmd=( "$PYTHON_BIN" app/run_edge.py
   --bayes_only
   --bayes_calls "${BO_CALLS:-16}"
   --bayes_init_points "${BO_INIT_POINTS:-1}"
-  --bayes_tokens_per_trial "${BO_TOKENS_PER_TRIAL:-20}"
+  --bayes_tokens_per_sample "${BO_TOKENS_PER_SAMPLE:-${BO_TOKENS_PER_TRIAL:-20}}"
   --bayes_ei_xi "${BO_EI_XI:-0.1}"
   --bayes_single_min "${BO_SINGLE_MIN:-0.000001}"
   --bayes_single_max "${BO_SINGLE_MAX:-1.0}"

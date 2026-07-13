@@ -10,7 +10,7 @@ from .util import seed_everything, softmax, strategy2exp
 from .merge import OnlineEnvironmentEstimator, PaperDPScheduler
 import time
 import numpy as np
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 import msgpack
 import threading
 from .comm import BandwidthSender
@@ -116,7 +116,7 @@ class Decoding(ABC):
         self.num_spec_tokens_generated = 0
         self._spec_token_indices_generated = []
         self._spec_token_indices_sent = set()
-        self._token_time_ref = time.time()
+        self._token_time_ref = 0.0
 
         self.verify_thresh_single = self.args.verify_thresh_single
         self.verify_thresh_multi = self.args.verify_thresh_multi
@@ -144,7 +144,6 @@ class Decoding(ABC):
         )
         if self.online_environment_measurement and self._uses_dp_scheduler():
             self._ensure_communication_bootstrap(force_initial=True)
-            self._token_time_ref = time.time()
 
     def _uses_dp_scheduler(self) -> bool:
         return self.merge_policy == "dp" and ("pipesd" in self.algorithm or "merge" in self.algorithm)
@@ -228,6 +227,33 @@ class Decoding(ABC):
         per_token = elapsed / token_count
         self._token_durations.extend([per_token] * token_count)
         self._token_time_ref = now
+
+    def _commit_verified_tokens(
+        self,
+        output_tokens: List[int],
+        speculative_tokens: List[int],
+        n_accepted: int,
+        final_token: Optional[int],
+    ) -> int:
+        """Commit a verification result without exceeding the generation budget."""
+        remaining = max(0, self.max_len - len(output_tokens))
+        accepted_count = min(max(0, int(n_accepted)), len(speculative_tokens), remaining)
+        committed = list(speculative_tokens[:accepted_count])
+        output_tokens.extend(committed)
+        if len(committed) < remaining and final_token is not None:
+            output_tokens.append(final_token)
+            committed.append(final_token)
+        self._record_token_time(len(committed))
+        return len(committed)
+
+    def _must_verify_for_budget(
+        self,
+        output_tokens: List[int],
+        speculative_tokens: List[int],
+        waiting_tokens: Optional[List[int]] = None,
+    ) -> bool:
+        pending_count = len(speculative_tokens) + len(waiting_tokens or [])
+        return len(output_tokens) + pending_count >= self.max_len - 1
 
     def _build_histogram(self, values: List[int]) -> Dict[str, int]:
         hist: Dict[str, int] = {}
@@ -383,7 +409,13 @@ class Decoding(ABC):
 
         return saved_path
     
-    def edge_process_draft_model(self, prefix, task_id, persist_result: bool = True):
+    def edge_process_draft_model(
+        self,
+        prefix,
+        task_id,
+        persist_result: bool = True,
+        max_accepted_tokens: Optional[int] = None,
+    ):
         """
         [最终修正 & 多任务版] 边缘端工作进程。
         一个一个生成token，满足发送条件就发送，满足验证条件时验证。
@@ -402,7 +434,10 @@ class Decoding(ABC):
         self.draft_model.reset()
         output_tokens = self.draft_model.tokenize(prefix.encode("utf-8"), add_bos=True)
         prefix_len = len(output_tokens)
-        self.max_len = prefix_len + self.max_generated_len
+        generation_budget = self.max_generated_len
+        if max_accepted_tokens is not None:
+            generation_budget = min(generation_budget, max(0, int(max_accepted_tokens)))
+        self.max_len = prefix_len + generation_budget
         self.color_print(f"[Edge] 任务 {task_id} 开始处理，prefix 长度 {len(output_tokens)}", 2)
 
         init_payload = {'type': 'init', 'tokens': output_tokens, 'task_id': task_id}
@@ -438,7 +473,10 @@ class Decoding(ABC):
 
         merge_plan_index = 0
         
-        total_start_time = time.time()
+        # Measure generation only after model loading, communication bootstrap,
+        # cloud prompt initialization, and the initial DP plan are ready.
+        self._token_time_ref = time.time()
+        total_start_time = self._token_time_ref
         while len(output_tokens) < self.max_len:
             
             # --- 1. 生成一个token ---
@@ -477,6 +515,10 @@ class Decoding(ABC):
             should_verify = self.if_verify(
                 total_speculative_probs,
                 self.verify_strategy
+            )
+            should_verify = should_verify or self._must_verify_for_budget(
+                output_tokens,
+                total_speculative_tokens,
             )
 
             should_end = (next_token == self.draft_model.token_eos())  # 结束条件
@@ -553,6 +595,11 @@ class Decoding(ABC):
                         waiting_probs,
                         self.verify_strategy
                     )
+                    should_verify_waiting = should_verify_waiting or self._must_verify_for_budget(
+                        output_tokens,
+                        total_speculative_tokens,
+                        waiting_tokens,
+                    )
                     
                     if future.done():
                         verify_result = future.result()
@@ -615,10 +662,12 @@ class Decoding(ABC):
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
-                accepted_tokens = total_speculative_tokens[:n_accepted]
-                output_tokens.extend(accepted_tokens)
-                output_tokens.append(final_token)
-                self._record_token_time(len(accepted_tokens) + 1)
+                self._commit_verified_tokens(
+                    output_tokens,
+                    total_speculative_tokens,
+                    n_accepted,
+                    final_token,
+                )
                 
                 last_verify_all_passed = (n_accepted == len(total_speculative_tokens) and final_token == speculated_final_token)
                 if not last_verify_all_passed:
@@ -642,6 +691,12 @@ class Decoding(ABC):
                 # --- 5. 处理等待期间生成的token ---
                 # print(f"[DEBUG] 验证期间生成了 {len(waiting_tokens)} 个token，n_accepted={n_accepted}")
                 waiting_batch_future = None
+                if len(output_tokens) >= self.max_len:
+                    for fut in waiting_futures:
+                        if not fut.done():
+                            self.sender.cancel_future(fut)
+                    self.sender.drain_tag(waiting_tag)
+                    waiting_tokens = []
                 if waiting_tokens:
                     # print(f"[DEBUG] final_token: {final_token}, speculated_final_token: {speculated_final_token}, n_accepted: {n_accepted}, total_speculative_tokens: {len(total_speculative_tokens)}")
                     # 仅重打包那些尚未出队发送的等待请求：排除已完成/已取消/已 in-flight 的 future
@@ -727,10 +782,12 @@ class Decoding(ABC):
                         merge_plan_batches = self._resolve_merge_plan()
                         if waiting_spec_len > 0:
                             self.acc_ratio += n_accepted_waiting / waiting_spec_len
-                        accepted_waiting_tokens = waiting_tokens[:n_accepted_waiting] if waiting_tokens else []
-                        output_tokens.extend(accepted_waiting_tokens)
-                        output_tokens.append(final_token_waiting)
-                        self._record_token_time(len(accepted_waiting_tokens) + 1)
+                        self._commit_verified_tokens(
+                            output_tokens,
+                            waiting_tokens,
+                            n_accepted_waiting,
+                            final_token_waiting,
+                        )
                         # The waiting branch may have advanced llama.cpp's KV cache beyond
                         # the accepted prefix. Rebuild from the committed output to keep
                         # n_tokens and the internal cache consistent before continuing.

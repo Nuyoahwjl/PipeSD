@@ -5,7 +5,6 @@ sys.path.append(os.path.join(sys.path[0], "../"))
 import torch
 import time
 import json
-import itertools
 from pathlib import Path
 from multiprocessing import Queue
 
@@ -132,19 +131,41 @@ class CloudEdgeSpeculativeEval(Decoding):
         with path.open("w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
-    def _run_latency_trial(self, thresh_single: float, thresh_multi: float, min_tokens: int):
+    def _run_latency_trial(self, thresh_single: float, thresh_multi: float, tokens_per_sample: int):
         # BO candidates must be evaluated independently.  Formal evaluation
         # intentionally keeps cumulative token durations, so reset the shared
         # buffer only at the BO-trial boundary.
         self._token_durations = []
-        samples_iter = itertools.cycle(self.samples)
         self.args.verify_thresh_single = thresh_single
         self.args.verify_thresh_multi = thresh_multi
-        while len(self._token_durations) < min_tokens:
-            sample = next(samples_iter)
-            prompt, task_id = self.preprocess(sample)
-            self._reset_state()
-            self.edge_process_draft_model(prompt, task_id, persist_result=False)
+        if tokens_per_sample <= 0:
+            raise ValueError("bayes_tokens_per_sample must be positive")
+
+        # Evaluate every selected sample with the same accepted-token budget.
+        # The objective is the token-weighted mean over all collected latencies;
+        # e.g. 10 samples x 20 tokens = 200 tokens per BO candidate.
+        for sample in self.samples:
+            sample_start = len(self._token_durations)
+            no_progress = 0
+            while len(self._token_durations) - sample_start < tokens_per_sample:
+                before = len(self._token_durations)
+                prompt, task_id = self.preprocess(sample)
+                self._reset_state()
+                remaining = tokens_per_sample - (before - sample_start)
+                self.edge_process_draft_model(
+                    prompt,
+                    task_id,
+                    persist_result=False,
+                    max_accepted_tokens=remaining,
+                )
+                if len(self._token_durations) == before:
+                    no_progress += 1
+                    if no_progress >= 2:
+                        raise RuntimeError(
+                            f"BO trial could not collect accepted tokens from task {task_id}."
+                        )
+                else:
+                    no_progress = 0
         return list(self._token_durations)
 
     def bayes_optimize_thresholds(self):
@@ -159,7 +180,11 @@ class CloudEdgeSpeculativeEval(Decoding):
         if not self.samples:
             self.color_print("[Main] 无样本可用于贝叶斯优化，直接退出。", 1)
             return
-        tokens_target = getattr(self.args, "bayes_tokens_per_trial", 20)
+        tokens_target = getattr(self.args, "bayes_tokens_per_sample", None)
+        if tokens_target is None:
+            tokens_target = getattr(self.args, "bayes_tokens_per_trial", None)
+        if tokens_target is None:
+            tokens_target = 20
         log_path = Path(self.exp_name) / "bayes_trials.json"
         search_space = [
             Real(self.args.bayes_single_min, self.args.bayes_single_max, name="verify_thresh_single"),
@@ -177,6 +202,8 @@ class CloudEdgeSpeculativeEval(Decoding):
                 "thresh_multi": thresh_multi,
                 "avg_token_time": avg_latency,
                 "num_tokens": len(latencies),
+                "num_samples": len(self.samples),
+                "tokens_per_sample": tokens_target,
                 "latencies": latencies,
             }
             self._append_bayes_record(log_path, record)
