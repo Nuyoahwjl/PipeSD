@@ -5,6 +5,13 @@ sys.path.append(os.path.join(sys.path[0], "../"))
 import torch
 import time
 import json
+import hashlib
+import itertools
+import platform
+import socket
+import statistics
+import subprocess
+import uuid
 from pathlib import Path
 from multiprocessing import Queue
 
@@ -21,6 +28,7 @@ class CloudEdgeSpeculativeEval(Decoding):
         # 将队列的创建也移到这里，作为类的属性
         self.request_queue = Queue()
         self.response_queue = Queue()
+        args.run_id = getattr(args, "run_id", "") or uuid.uuid4().hex
         super().__init__(args)
         self.samples = self.load_data()
 
@@ -65,7 +73,13 @@ class CloudEdgeSpeculativeEval(Decoding):
                 self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 prompt 字段", 1)
                 continue
             task_id = item.get("task_id", item.get("question_id", idx))
-            samples.append({"prompt": prompt, "task_id": task_id})
+            samples.append({
+                "prompt": prompt,
+                "task_id": task_id,
+                "sample_index": idx,
+                "canonical_solution": item.get("canonical_solution"),
+                "entry_point": item.get("entry_point"),
+            })
         return samples
 
     def _load_gsm8k_samples(self, raw_samples):
@@ -76,7 +90,12 @@ class CloudEdgeSpeculativeEval(Decoding):
                 self.color_print(f"[Main] 跳过第 {idx} 个样本：缺少 question 字段", 1)
                 continue
             # GSM8K 不包含显式 id，这里按顺序分配 task_id
-            samples.append({"prompt": question, "task_id": idx})
+            samples.append({
+                "prompt": question,
+                "task_id": idx,
+                "sample_index": idx,
+                "reference_answer": item.get("answer"),
+            })
         return samples
 
     def preprocess(self, input_text):
@@ -122,7 +141,8 @@ class CloudEdgeSpeculativeEval(Decoding):
     def _append_bayes_record(self, path: Path, record: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            existing = json.load(path.open("r", encoding="utf-8"))
+            with path.open("r", encoding="utf-8") as handle:
+                existing = json.load(handle)
             if not isinstance(existing, list):
                 existing = []
         except Exception:
@@ -131,44 +151,105 @@ class CloudEdgeSpeculativeEval(Decoding):
         with path.open("w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
 
-    def _run_latency_trial(self, thresh_single: float, thresh_multi: float, tokens_per_sample: int):
-        # BO candidates must be evaluated independently.  Formal evaluation
-        # intentionally keeps cumulative token durations, so reset the shared
-        # buffer only at the BO-trial boundary.
-        self._token_durations = []
+    def _reset_run_duration_buffers(self):
+        self._run_token_durations = []
+        self._token_durations = self._run_token_durations
+
+    def _write_latest_bayes_config(self, record: dict) -> Path:
+        """Write one stable, machine-readable config consumed by eval scripts."""
+        path = Path(self.exp_name) / "latest_bayes_best.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "dataset": self.args.dataset,
+            "algorithm": self.algorithm,
+            "seed": self.seed,
+            "run_id": self.args.run_id,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "bo_protocol": getattr(self.args, "bo_protocol", "paper"),
+            **record,
+        }
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        return path
+
+    def _run_latency_trial(
+        self,
+        thresh_single: float,
+        thresh_multi: float,
+        token_budget: int = None,
+        tokens_per_sample: int = None,
+    ):
+        """Evaluate one BO candidate under the selected reproducible protocol."""
+        legacy_sample_coverage = tokens_per_sample is not None
+        if token_budget is None:
+            token_budget = tokens_per_sample
+        self._reset_run_duration_buffers()
+        if hasattr(self, "dp_scheduler"):
+            self.dp_scheduler.reset_workload_history()
         self.args.verify_thresh_single = thresh_single
         self.args.verify_thresh_multi = thresh_multi
-        if tokens_per_sample <= 0:
-            raise ValueError("bayes_tokens_per_sample must be positive")
+        if token_budget <= 0:
+            raise ValueError("BO accepted-token budget must be positive")
 
-        # Evaluate every selected sample with the same accepted-token budget.
-        # The objective is the token-weighted mean over all collected latencies;
-        # e.g. 10 samples x 20 tokens = 200 tokens per BO candidate.
-        for sample in self.samples:
-            sample_start = len(self._token_durations)
+        protocol = "sample_coverage" if legacy_sample_coverage else getattr(self.args, "bo_protocol", "paper")
+        observed_sample_indices = []
+        if protocol == "paper":
+            samples_iter = itertools.cycle(self.samples)
             no_progress = 0
-            while len(self._token_durations) - sample_start < tokens_per_sample:
+            while len(self._token_durations) < token_budget:
+                sample = next(samples_iter)
                 before = len(self._token_durations)
                 prompt, task_id = self.preprocess(sample)
                 self._reset_state()
-                remaining = tokens_per_sample - (before - sample_start)
                 self.edge_process_draft_model(
                     prompt,
                     task_id,
                     persist_result=False,
-                    max_accepted_tokens=remaining,
+                    max_accepted_tokens=token_budget - before,
                 )
+                observed_sample_indices.append(sample.get("sample_index", task_id) if isinstance(sample, dict) else task_id)
                 if len(self._token_durations) == before:
                     no_progress += 1
-                    if no_progress >= 2:
-                        raise RuntimeError(
-                            f"BO trial could not collect accepted tokens from task {task_id}."
-                        )
+                    if no_progress >= max(2, len(self.samples)):
+                        raise RuntimeError("paper BO trial could not collect accepted tokens")
                 else:
                     no_progress = 0
+        elif protocol == "sample_coverage":
+            for sample in self.samples:
+                sample_start = len(self._token_durations)
+                no_progress = 0
+                while len(self._token_durations) - sample_start < token_budget:
+                    before = len(self._token_durations)
+                    prompt, task_id = self.preprocess(sample)
+                    self._reset_state()
+                    remaining = token_budget - (before - sample_start)
+                    self.edge_process_draft_model(
+                        prompt,
+                        task_id,
+                        persist_result=False,
+                        max_accepted_tokens=remaining,
+                    )
+                    observed_sample_indices.append(sample.get("sample_index", task_id) if isinstance(sample, dict) else task_id)
+                    if len(self._token_durations) == before:
+                        no_progress += 1
+                        if no_progress >= 2:
+                            raise RuntimeError(
+                                f"BO trial could not collect accepted tokens from task {task_id}."
+                            )
+                    else:
+                        no_progress = 0
+        else:
+            raise ValueError(f"unknown BO protocol: {protocol}")
+        self._last_bo_sample_indices = observed_sample_indices
         return list(self._token_durations)
 
     def bayes_optimize_thresholds(self):
+        if self.algorithm != "pipesd":
+            raise ValueError(
+                "--bayes_optimize is supported only for PipeSD; EdgeLLM "
+                "follows the paper's explicit per-setup initial R1."
+            )
         try:
             from skopt import gp_minimize
             from skopt.space import Real
@@ -180,12 +261,11 @@ class CloudEdgeSpeculativeEval(Decoding):
         if not self.samples:
             self.color_print("[Main] 无样本可用于贝叶斯优化，直接退出。", 1)
             return
-        tokens_target = getattr(self.args, "bayes_tokens_per_sample", None)
-        if tokens_target is None:
-            tokens_target = getattr(self.args, "bayes_tokens_per_trial", None)
-        if tokens_target is None:
-            tokens_target = 20
-        log_path = Path(self.exp_name) / "bayes_trials.json"
+        if getattr(self.args, "bo_protocol", "paper") == "paper":
+            tokens_target = getattr(self.args, "bayes_tokens_per_trial", 20)
+        else:
+            tokens_target = getattr(self.args, "bayes_tokens_per_sample", None) or 20
+        log_path = Path(self.exp_name) / f"bayes_trials_run={self.args.run_id}.json"
         search_space = [
             Real(self.args.bayes_single_min, self.args.bayes_single_max, name="verify_thresh_single"),
             Real(self.args.bayes_multi_min, self.args.bayes_multi_max, name="verify_thresh_multi"),
@@ -203,7 +283,10 @@ class CloudEdgeSpeculativeEval(Decoding):
                 "avg_token_time": avg_latency,
                 "num_tokens": len(latencies),
                 "num_samples": len(self.samples),
-                "tokens_per_sample": tokens_target,
+                "bo_protocol": getattr(self.args, "bo_protocol", "paper"),
+                "accepted_token_budget": tokens_target,
+                "sample_indices": list(getattr(self, "_last_bo_sample_indices", [])),
+                "run_id": self.args.run_id,
                 "latencies": latencies,
             }
             self._append_bayes_record(log_path, record)
@@ -229,6 +312,11 @@ class CloudEdgeSpeculativeEval(Decoding):
             "best_avg_token_time": float(result.fun),
         }
         self._append_bayes_record(log_path, {"best": best_record})
+        self._write_latest_bayes_config({
+            **best_record,
+            "accepted_token_budget": tokens_target,
+            "bayes_calls": getattr(self.args, "bayes_calls", 16),
+        })
         self.color_print(
             f"[Bayes] 最优阈值: st={best_single:.4f}, mt={best_multi:.4f}, avg={result.fun:.6f}",
             2,
@@ -239,10 +327,198 @@ class CloudEdgeSpeculativeEval(Decoding):
         self.verify_thresh_multi = float(best_multi)
         return best_record
 
+    @staticmethod
+    def _sha256_file(path):
+        if not path or not os.path.isfile(path):
+            return None
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _git_value(*args):
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return completed.stdout.strip()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _percentile(values, percentile):
+        if not values:
+            return None
+        ordered = sorted(float(value) for value in values)
+        if len(ordered) == 1:
+            return ordered[0]
+        rank = (len(ordered) - 1) * percentile
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = rank - lower
+        return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
+
+    def _build_manifest(self):
+        return {
+            "run_id": self.args.run_id,
+            "git_commit": self._git_value("rev-parse", "HEAD"),
+            "git_status": self._git_value("status", "--porcelain"),
+            "created_at_unix": time.time(),
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "cpu_count": os.cpu_count(),
+            "dataset": self.args.dataset,
+            "algorithm": self.algorithm,
+            "seed": self.seed,
+            "evaluation_protocol": self.args.evaluation_protocol,
+            "target_output_tokens": self.args.target_output_tokens,
+            "uplink_bandwidth_MBps": self.bandwidth_MBps,
+            "downlink_bandwidth_MBps": getattr(self.args, "downlink_bandwidth_MBps", None),
+            "network_shaping_mode": getattr(self.args, "network_shaping_mode", "software"),
+            "draft_model_path": self.args.draft_model,
+            "draft_model_sha256": self._sha256_file(self.args.draft_model),
+            "target_model_sha256": os.environ.get("PIPE_SD_TARGET_MODEL_SHA256"),
+            "data_path": self.args.data_path,
+            "data_sha256": self._sha256_file(self.args.data_path),
+            "arguments": vars(self.args),
+        }
+
+    def _build_run_summary(self, sample_results):
+        actual_tokens = sum(int(item.get("output_length", 0)) for item in sample_results)
+        total_time = sum(float(item.get("total_time", 0.0)) for item in sample_results)
+        durations = [
+            float(duration)
+            for item in sample_results
+            for duration in item.get("token_durations", [])
+        ]
+        num_verifications = sum(
+            int(item.get("verify_stats", {}).get("num_verifications", 0))
+            for item in sample_results
+        )
+        draft_tokens = sum(
+            sum(item.get("verify_spec_lengths", []))
+            for item in sample_results
+        )
+        accepted_drafts = sum(
+            sum(item.get("verify_accept_lengths", []))
+            for item in sample_results
+        )
+        rollback_events = sum(
+            int(item.get("diagnostics", {}).get("rollback_events", 0))
+            for item in sample_results
+        )
+        batch_sizes = [
+            int(batch.get("actual_batch_size", 0))
+            for item in sample_results
+            for batch in item.get("batch_trace", [])
+            if int(batch.get("actual_batch_size", 0)) > 0
+        ]
+        total_energy = sum(
+            float(item.get("gpu_power_integral_joules") or 0.0)
+            for item in sample_results
+        )
+        return {
+            "evaluation_protocol": self.args.evaluation_protocol,
+            "target_output_tokens": int(self.args.target_output_tokens),
+            "actual_output_tokens": actual_tokens,
+            "sample_indices": [item.get("sample_index") for item in sample_results],
+            "num_samples": len(sample_results),
+            "total_time_seconds": total_time,
+            "weighted_tpt_seconds": total_time / actual_tokens if actual_tokens else None,
+            "weighted_tpt_ms": 1000.0 * total_time / actual_tokens if actual_tokens else None,
+            "token_latency_p50_seconds": self._percentile(durations, 0.50),
+            "token_latency_p95_seconds": self._percentile(durations, 0.95),
+            "num_verifications": num_verifications,
+            "verification_frequency": num_verifications / actual_tokens if actual_tokens else None,
+            "mean_draft_length": draft_tokens / num_verifications if num_verifications else None,
+            "acceptance_rate": accepted_drafts / draft_tokens if draft_tokens else None,
+            "rollback_rate": rollback_events / num_verifications if num_verifications else None,
+            "mean_actual_batch_size": statistics.fmean(batch_sizes) if batch_sizes else None,
+            "cap_hit_count": sum(1 for item in sample_results if item.get("generation_cap_hit")),
+            "cap_hit_rate": (
+                sum(1 for item in sample_results if item.get("generation_cap_hit")) / len(sample_results)
+                if sample_results else None
+            ),
+            "eos_count": sum(1 for item in sample_results if item.get("ended_with_eos")),
+            "gpu_energy_joules": total_energy,
+            "gpu_energy_joules_per_100_tokens": 100.0 * total_energy / actual_tokens if actual_tokens else None,
+        }
+
+    def _paper_result_path(self):
+        bandwidth_label = f"{self.bandwidth_MBps:g}"
+        legacy_path = Path(self.exp2path(bandwidth_label))
+        safe_run_id = "".join(ch for ch in self.args.run_id if ch.isalnum() or ch in "-_")
+        return legacy_path.with_name(f"{legacy_path.stem}_run={safe_run_id}.json")
+
+    def _run_paper_table1(self):
+        target_tokens = int(self.args.target_output_tokens)
+        if target_tokens <= 0:
+            raise ValueError("target_output_tokens must be positive")
+        if not self.samples:
+            raise RuntimeError("no dataset samples are available")
+
+        self._reset_run_duration_buffers()
+        sample_results = []
+        samples_iter = itertools.cycle(self.samples)
+        actual_tokens = 0
+        no_progress = 0
+        while actual_tokens < target_tokens:
+            sample = next(samples_iter)
+            prompt, task_id = self.preprocess(sample)
+            self._reset_state()
+            result = self.edge_process_draft_model(
+                prompt,
+                task_id,
+                persist_result=False,
+                max_accepted_tokens=target_tokens - actual_tokens,
+            )
+            if not isinstance(result, dict):
+                no_progress += 1
+                if no_progress >= len(self.samples):
+                    raise RuntimeError("a complete dataset pass produced no accepted tokens")
+                continue
+            produced = int(result.get("output_length", 0))
+            if produced <= 0:
+                no_progress += 1
+                if no_progress >= len(self.samples):
+                    raise RuntimeError("a complete dataset pass produced no accepted tokens")
+                continue
+            no_progress = 0
+            result["sample_index"] = sample.get("sample_index", task_id)
+            result["dataset_task_id"] = sample.get("task_id", task_id)
+            if self.args.dataset.lower() == "gsm8k":
+                result["reference_answer"] = sample.get("reference_answer")
+            else:
+                result["canonical_solution"] = sample.get("canonical_solution")
+                result["entry_point"] = sample.get("entry_point")
+            sample_results.append(result)
+            actual_tokens += produced
+
+        if actual_tokens != target_tokens:
+            raise RuntimeError(f"paper protocol produced {actual_tokens} tokens, expected {target_tokens}")
+
+        payload = {
+            "manifest": self._build_manifest(),
+            "summary": self._build_run_summary(sample_results),
+            "samples": sample_results,
+        }
+        result_path = self._paper_result_path()
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        with result_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        self.color_print(f"[Main] paper_table1 result: {result_path}", 2)
+        return payload
+
     @torch.no_grad()
     def eval(self):
         if getattr(self.args, "bayes_optimize", False):
-            if self.verify_strategy != "hybrid":
+            if self.algorithm != "edgeLLM" and self.verify_strategy != "hybrid":
                 self.color_print("[Main] 当前策略非 hybrid，将自动切换为 hybrid 进行阈值搜索。", 3)
                 self.verify_strategy = "hybrid"
             self.bayes_optimize_thresholds()
@@ -252,6 +528,9 @@ class CloudEdgeSpeculativeEval(Decoding):
             self.color_print("[Main] BO 完成，使用最优阈值继续正式评测。", 2)
         # start_time = time.time()
         seed_everything(self.args.seed)
+        if getattr(self.args, "evaluation_protocol", "sample_index") == "paper_table1":
+            return self._run_paper_table1()
+        self._reset_run_duration_buffers()
         for i in range(1):
             for sample in self.samples:
                 prompt, task_id = self.preprocess(sample)

@@ -17,6 +17,7 @@ class PendingRequest:
     headers: Dict[str, str]
     future: concurrent.futures.Future
     token_count: Optional[int] = None
+    measurement_kind: Optional[str] = None
     cancelled: bool = False
     inflight: bool = False  # 标记是否已被工作线程取出并开始发送
 
@@ -37,6 +38,7 @@ class BandwidthSender:
         base_latency: float = 0.0,
         timeout: int = 10,
         use_env_proxy: bool = False,
+        software_bandwidth_emulation: bool = True,
         on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         self._q = queue.Queue()
@@ -44,6 +46,7 @@ class BandwidthSender:
         self._base_latency = base_latency
         self._timeout = timeout
         self._use_env_proxy = use_env_proxy
+        self._software_bandwidth_emulation = bool(software_bandwidth_emulation)
         self._on_complete = on_complete
         self._lock = threading.Lock()
         self._pending_requests = collections.defaultdict(collections.deque)
@@ -56,7 +59,15 @@ class BandwidthSender:
         with self._lock:
             self._bandwidth_bytes = bandwidth_MBps * 1_000_000
 
-    def submit(self, url, payload, headers=None, tag=None, token_count=None):
+    def submit(
+        self,
+        url,
+        payload,
+        headers=None,
+        tag=None,
+        token_count=None,
+        measurement_kind=None,
+    ):
         fut = concurrent.futures.Future()
         request = PendingRequest(
             tag=tag,
@@ -65,6 +76,7 @@ class BandwidthSender:
             headers=headers or {},
             future=fut,
             token_count=token_count,
+            measurement_kind=measurement_kind,
         )
         with self._lock:
             self._future_to_request[fut] = request
@@ -194,6 +206,7 @@ class BandwidthSender:
                 "url": request.url,
                 "payload_size": request.payload_size,
                 "token_count": request.token_count,
+                "measurement_kind": request.measurement_kind,
                 "elapsed_seconds": max(0.0, finished_at - started_at),
                 "success": success,
             })
@@ -218,10 +231,12 @@ class BandwidthSender:
                     self._release_pending(request)
                     continue
 
-                if self._bandwidth_bytes > 0:
+                if self._software_bandwidth_emulation and self._bandwidth_bytes > 0:
                     quota = (request.payload_size / self._bandwidth_bytes) + self._base_latency
-                else:
+                elif self._software_bandwidth_emulation:
                     quota = self._base_latency
+                else:
+                    quota = 0.0
                 with self._lock:
                     now = time.monotonic()
 

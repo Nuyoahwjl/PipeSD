@@ -14,7 +14,7 @@ HSL_THRESH="${HSL_THRESH:-0.99}"
 PIPESD_SINGLE_THRESH="${PIPESD_SINGLE_THRESH:-0.9}"
 PIPESD_MULTI_THRESH="${PIPESD_MULTI_THRESH:-0.95}"
 EDGELLM_INIT_ALPHA="${EDGELLM_INIT_ALPHA:-0.92}"
-EDGELLM_MULTIPLY_TIMES="${EDGELLM_MULTIPLY_TIMES:-0.95}"
+EDGELLM_FULL_ACCEPT_DECAY="${EDGELLM_FULL_ACCEPT_DECAY:-0.5}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 append_extra_args() {
@@ -78,7 +78,7 @@ cmd=( "$PYTHON_BIN" app/run_edge.py
   --dataset "$DATASET"
   --algorithm edgeLLM
   --init_alpha "$EDGELLM_INIT_ALPHA"
-  --multiply_times "$EDGELLM_MULTIPLY_TIMES"
+  --edge_llm_full_accept_decay "$EDGELLM_FULL_ACCEPT_DECAY"
   --bandwidth_MBps "$BANDWIDTH_MBPS"
   --start_index_of_sample "$START_INDEX"
   --end_index_of_sample "$END_INDEX"

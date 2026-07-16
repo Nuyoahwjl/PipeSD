@@ -7,7 +7,7 @@ transformers.utils.logging.set_verbosity(40)
 warnings.filterwarnings("ignore")
 from abc import ABC, abstractmethod
 from .util import seed_everything, softmax, strategy2exp
-from .merge import OnlineEnvironmentEstimator, PaperDPScheduler
+from .merge import OnlineEnvironmentEstimator, PaperDPScheduler, next_plan_index
 import time
 import numpy as np
 from typing import List, Dict, Optional, Tuple
@@ -32,6 +32,7 @@ def resolve_server_url() -> str:
 URL = resolve_server_url()
 
 INIT_ENDPOINT = f"{URL}/init"
+START_ENDPOINT = f"{URL}/start"
 PROPOSE_ENDPOINT = f"{URL}/propose"
 EXIT_ENDPOINT = f"{URL}/exit"
 DELAY_ENDPOINT = f"{URL}/delay"
@@ -78,7 +79,10 @@ class Decoding(ABC):
         self.start_index_of_sample = getattr(args, 'start_index_of_sample', 0)
         self.end_index_of_sample = getattr(args, 'end_index_of_sample', 1)
         self._token_time_ref: float = 0.0
-        self._token_durations: List[float] = []
+        self._run_token_durations: List[float] = []
+        self._sample_token_durations: List[float] = []
+        # Backward-compatible alias used by older analysis helpers.
+        self._token_durations = self._run_token_durations
         self.process_started_at: float = time.time()
         self.process_model_ready_at: float = self.process_started_at
         self.online_environment_measurement = not getattr(self.args, "disable_online_environment_measurement", False)
@@ -91,19 +95,23 @@ class Decoding(ABC):
         self.dp_scheduler = PaperDPScheduler(
             alpha=self.C,
             beta=(self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
-            gamma=self.args.default_token_compute,
+            gamma=getattr(self.args, "initial_generation_gamma", None)
+            or getattr(self.args, "default_token_compute", None)
+            or 0.036,
             initial_window=getattr(self.args, "schedule_window", 20),
             history_size=getattr(self.args, "schedule_history_size", 100),
-            update_threshold=getattr(self.args, "environment_update_threshold", 0.2),
+            update_threshold=getattr(self.args, "environment_update_threshold", None),
+            gamma_update_threshold=getattr(self.args, "gamma_update_threshold", 0.2),
+            communication_update_threshold=getattr(self.args, "communication_update_threshold", 0.2),
         )
         # self.exp_name = strategy2exp(self.verify_strategy)
         self.exp_name = os.path.join(os.getcwd(), 'exp', "exp__wjl", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
-        if self.algorithm == "vanilla" or self.algorithm == "hsl":
-            self.send_while_generating = False
-        else:
-            self.send_while_generating = True
+        # Only the two proactive methods generate while a NAV request is in
+        # flight.  Vanilla/HSL stop generation and upload their whole draft in
+        # the NAV request, matching the baseline definitions in the paper.
+        self.send_while_generating = self.algorithm in {"edgeLLM", "pipesd"}
         
 
     def _reset_state(self):
@@ -117,6 +125,9 @@ class Decoding(ABC):
         self._spec_token_indices_generated = []
         self._spec_token_indices_sent = set()
         self._token_time_ref = 0.0
+        self._sample_token_durations = []
+        self.batch_trace = []
+        self._speculative_round_id = 0
 
         self.verify_thresh_single = self.args.verify_thresh_single
         self.verify_thresh_multi = self.args.verify_thresh_multi
@@ -135,18 +146,43 @@ class Decoding(ABC):
             self.process_model_ready_at = end_time
         self.color_print(f"[Edge] 模型加载完成，耗时: {end_time - start_time:.2f} 秒", 5)
 
-        self.sender = BandwidthSender(
-            bandwidth_MBps=self.bandwidth_MBps,
-            base_latency=self.C,
-            timeout=getattr(self.args, "server_timeout_s", 10),
-            use_env_proxy=getattr(self.args, "use_env_proxy", False),
-            on_complete=self._on_send_measurement if self.online_environment_measurement else None,
-        )
+        sender_kwargs = {
+            "bandwidth_MBps": self.bandwidth_MBps,
+            "base_latency": self.C,
+            "timeout": getattr(self.args, "server_timeout_s", 10),
+            "use_env_proxy": getattr(self.args, "use_env_proxy", False),
+            "software_bandwidth_emulation": (
+                getattr(self.args, "network_shaping_mode", "software") == "software"
+            ),
+            "on_complete": self._on_send_measurement if self.online_environment_measurement else None,
+        }
+        # Pre-NAV traffic remains ordered on the primary channel. A second
+        # channel can upload next-round batches while NAV is still running.
+        self.sender = BandwidthSender(**sender_kwargs)
+        self.proactive_sender = BandwidthSender(**sender_kwargs)
         if self.online_environment_measurement and self._uses_dp_scheduler():
             self._ensure_communication_bootstrap(force_initial=True)
 
     def _uses_dp_scheduler(self) -> bool:
         return self.merge_policy == "dp" and ("pipesd" in self.algorithm or "merge" in self.algorithm)
+
+    def _uses_pre_nav_pipeline(self) -> bool:
+        """Whether draft batches may be uploaded before NAV is triggered."""
+        return self.algorithm == "pipesd" and not getattr(self.args, "nomerge", False)
+
+    def _resolve_algorithm_batch_plan(self) -> List[int]:
+        """Return the upload plan owned by the selected algorithm.
+
+        PipeSD alone uses the paper DP scheduler before and during NAV.  The
+        EdgeLLM adaptation uses one moving-average N-hat batching window only
+        for proactive uploads made while NAV is pending.  Vanilla and HSL do
+        not consume this plan because they upload once, at NAV.
+        """
+        if self._uses_pre_nav_pipeline():
+            return self._resolve_merge_plan()
+        if self.algorithm == "edgeLLM":
+            return [max(1, int(self.dp_scheduler.window))]
+        return [max(1, int(self.max_generated_len))]
 
     def _ensure_communication_bootstrap(self, force_initial: bool = False) -> None:
         """Collect the paper's 1--8 token-batch communication probes."""
@@ -162,15 +198,22 @@ class Decoding(ABC):
             if not missing_sizes or (not force_initial and not history_full):
                 return
 
-            bytes_per_token = max(1, int(round(self.args.token_size_MB * 1_000_000)))
+            vocab_size = int(getattr(self.args, 'vocab_size', 32000))
+            probe_probs = [0.0] * vocab_size
             for batch_size in missing_sizes:
-                payload = bytes(bytes_per_token * batch_size)
+                payload = msgpack.packb({
+                    'type': 'communication_probe',
+                    'tokens': [0] * batch_size,
+                    'probs': [probe_probs] * batch_size,
+                    'token_count': batch_size,
+                })
                 future = self.sender.submit(
                     DELAY_ENDPOINT,
                     payload,
                     headers={"Content-Type": "application/octet-stream"},
                     tag=f"comm-bootstrap-{batch_size}",
                     token_count=batch_size,
+                    measurement_kind="transport",
                 )
                 future.result()
 
@@ -190,7 +233,11 @@ class Decoding(ABC):
                 self.dp_scheduler.observe_draft_length(draft_length)
 
     def _on_send_measurement(self, measurement: Dict[str, object]) -> None:
-        if not self.online_environment_measurement or not measurement.get("success"):
+        if (
+            not self.online_environment_measurement
+            or not measurement.get("success")
+            or measurement.get("measurement_kind") != "transport"
+        ):
             return
         token_count = measurement.get("token_count")
         elapsed_seconds = measurement.get("elapsed_seconds")
@@ -225,9 +272,44 @@ class Decoding(ABC):
         now = time.time()
         elapsed = max(0.0, now - self._token_time_ref)
         per_token = elapsed / token_count
-        self._token_durations.extend([per_token] * token_count)
+        durations = [per_token] * token_count
+        self._sample_token_durations.extend(durations)
+        self._run_token_durations.extend(durations)
+        self._token_durations = self._run_token_durations
         self._token_time_ref = now
 
+    def _apply_compute_emulation(self) -> None:
+        """Apply only the explicit Scenario 2/3 artificial delay."""
+        if not getattr(self.args, "enable_compute_emulation", False):
+            return
+        delay = max(0.0, float(getattr(self.args, "emulated_generation_delay", 0.0)))
+        if delay:
+            time.sleep(delay)
+
+    def _mark_sent(self, indices: List[int]) -> int:
+        new_indices = [idx for idx in indices if idx not in self._spec_token_indices_sent]
+        self._spec_token_indices_sent.update(new_indices)
+        self.num_spec_tokens_sent += len(new_indices)
+        return len(new_indices)
+
+    def _trace_batch(self, *, phase: str, batch_size: int, planned_size: int,
+                     plan_index: int, window_id: int, batch_id: int,
+                     token_start_index: int, should_verify: bool,
+                     flush_reason: Optional[str] = None) -> None:
+        self.batch_trace.append({
+            "phase": phase,
+            "speculative_round_id": self._speculative_round_id,
+            "window_id": window_id,
+            "batch_id": batch_id,
+            "plan_index": plan_index,
+            "planned_batch_size": planned_size,
+            "actual_batch_size": batch_size,
+            "token_start_index": token_start_index,
+            "should_verify": should_verify,
+            "flush_reason": flush_reason,
+            "scheduling_window": int(getattr(self.dp_scheduler, 'window', 0)) if self._uses_dp_scheduler() else None,
+            "planned_batches": self.dp_scheduler.plan() if self._uses_dp_scheduler() else None,
+        })
     def _commit_verified_tokens(
         self,
         output_tokens: List[int],
@@ -245,6 +327,20 @@ class Decoding(ABC):
             committed.append(final_token)
         self._record_token_time(len(committed))
         return len(committed)
+
+    @staticmethod
+    def _is_discarded_proactive_response(response) -> bool:
+        return (
+            isinstance(response, dict)
+            and response.get('status') == 'discarded_stale_proactive_batch'
+        )
+
+    def _rollback_discarded_waiting_round(self, output_tokens: List[int]) -> int:
+        """Discard an unusable proactive round and restore the verified prefix."""
+        self.draft_model.reset()
+        self.draft_model.eval(output_tokens)
+        self._speculative_round_id += 1
+        return self.draft_model.n_tokens
 
     def _must_verify_for_budget(
         self,
@@ -368,16 +464,34 @@ class Decoding(ABC):
     def postprocess(self, input_text, output_text):
         pass
     
-    def update_thresh(self, multiply_times, n_accepted, n_all):
-        if n_all == n_accepted:
+    def update_thresh(self, multiply_times, n_accepted, n_all, accumulated_probs=None):
+        if n_all <= 0:
+            return
+        confidence = self.accumulated_probs if accumulated_probs is None else accumulated_probs
+        scheduling_window = max(1, int(getattr(self.dp_scheduler, 'window', n_all)))
+        if self.algorithm == 'edgeLLM':
+            # Appendix G.3: compare N_correct with N-hat, not with the
+            # actually generated draft length.  Treat values above N-hat as
+            # reaching the window so numerical drift cannot invert the update.
+            if n_accepted >= scheduling_window:
+                self.alpha *= getattr(self.args, 'edge_llm_full_accept_decay', 0.5)
+            else:
+                exponent = (scheduling_window - n_accepted) / scheduling_window
+                temp = confidence ** exponent
+                if temp > 0:
+                    self.alpha /= temp
+                else:
+                    self.alpha /= 0.5
+        elif n_all == n_accepted:
             self.alpha *= multiply_times
         else:
-            temp = (self.accumulated_probs ** ((n_all - n_accepted) / n_all))
+            exponent = max(0.0, (scheduling_window - n_accepted) / scheduling_window)
+            temp = confidence ** exponent
             if temp > 0:
                 self.alpha /= temp
             else:
                 self.alpha /= 0.5
-            self.alpha = min(1.99, self.alpha)
+        self.alpha = min(1.0, max(1e-9, self.alpha))
     
     def exp2path(self, bandwidth_label: str):
         merge_suffix = ""
@@ -386,7 +500,8 @@ class Decoding(ABC):
         tag_suffix = f"_tag={self.result_tag}" if self.result_tag else ""
 
         if 'edgeLLM' in self.exp_name:
-            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_mult={self.multiply_times}{tag_suffix}_bw={bandwidth_label}MB.json")
+            decay = getattr(self.args, 'edge_llm_full_accept_decay', 0.5)
+            saved_path = os.path.join(self.exp_name, f"edgeLLM_alpha={self.args.init_alpha}_decay={decay}{tag_suffix}_bw={bandwidth_label}MB.json")
         elif 'single' in self.exp_name or 'hsl' in self.exp_name:
             saved_path = os.path.join(self.exp_name, f"st={self.verify_thresh_single}{tag_suffix}_bw={bandwidth_label}MB.json")
         elif 'hybrid' in self.exp_name or 'pipesd' in self.exp_name:
@@ -465,21 +580,30 @@ class Decoding(ABC):
         current_batch_probs = []
         current_batch_indices = []
 
-        if ('merge' in self.algorithm or 'pipesd' in self.algorithm) and not self.args.nomerge:
-            merge_plan_batches = self._resolve_merge_plan()
+        merge_plan_batches = self._resolve_algorithm_batch_plan()
+        if self._uses_pre_nav_pipeline():
             print(f"[Edge] 计算得到合并计划: {merge_plan_batches}")
-        else:
-            merge_plan_batches = [self.gamma * 4]
 
         merge_plan_index = 0
-        
+        merge_window_id = 0
+        merge_batch_id = 0
+
+        energy_start_result = self.sender.submit(
+            START_ENDPOINT,
+            {'task_id': task_id},
+            headers={"Content-Type": "application/json"},
+        ).result()
+        if energy_start_result is None or 'error' in energy_start_result:
+            raise RuntimeError(f"cloud task timing start failed: {energy_start_result}")
+
         # Measure generation only after model loading, communication bootstrap,
         # cloud prompt initialization, and the initial DP plan are ready.
         self._token_time_ref = time.time()
         total_start_time = self._token_time_ref
         while len(output_tokens) < self.max_len:
-            
+
             # --- 1. 生成一个token ---
+            generation_step_start = time.perf_counter()
             next_token = self.draft_model.sample(top_k=self.top_k, top_p=self.top_p, temp=self.temp)
             current_probs = softmax(self.draft_model.scores[self.draft_model.n_tokens-1])
             self.num_spec_tokens_generated += 1
@@ -491,13 +615,9 @@ class Decoding(ABC):
             current_batch_tokens.append(next_token)
             current_batch_indices.append(self._spec_token_indices_generated[-1])
             
-            start_eval = time.time()
             self.draft_model.eval([next_token])
-            end_eval = time.time()
-            eval_time = end_eval - start_eval
-            if eval_time < self.args.default_token_compute:
-                time.sleep(self.args.default_token_compute - eval_time)
-            self._observe_generation_time(1, time.time() - start_eval)
+            self._observe_generation_time(1, time.perf_counter() - generation_step_start)
+            self._apply_compute_emulation()
             
             # 获取概率分布
             
@@ -510,7 +630,10 @@ class Decoding(ABC):
                 self.verify_thresh_multi = self.alpha  # edgeLLM中多项式阈值等于alpha
 
             # --- 2. 检查发送和验证条件 ---
-            should_send = (len(current_batch_tokens) >= merge_plan_batches[merge_plan_index])  # 时间条件
+            should_send = (
+                self._uses_pre_nav_pipeline()
+                and len(current_batch_tokens) >= merge_plan_batches[merge_plan_index]
+            )
 
             should_verify = self.if_verify(
                 total_speculative_probs,
@@ -525,7 +648,12 @@ class Decoding(ABC):
 
             # 如果同时满足发送和验证条件，优先验证（因为验证需要处理结果）
             if should_verify or should_end:
-                merge_plan_index = 0  # 重置合并计划索引
+                # The waiting loop computes confidence for the next round, so
+                # retain the C1 belonging to this NAV before it can be replaced.
+                nav_accumulated_probs = self.accumulated_probs
+                nav_round_id = self._speculative_round_id
+                active_plan_index = merge_plan_index
+                active_planned_size = merge_plan_batches[active_plan_index]
                 # 发起验证请求 - 使用当前的n_past值
                 payload = {
                     'type': 'propose',
@@ -535,12 +663,30 @@ class Decoding(ABC):
                     'n_past': current_n_past,  # 使用当前的n_past
                     'index': len(total_speculative_tokens) - len(current_batch_tokens),  # 本次验证的索引（从0开始）
                     'should_verify': True,  # 验证请求
+                    'speculative_round_id': nav_round_id,
+                    'window_id': merge_window_id,
+                    'batch_id': merge_batch_id,
+                    'token_start_index': len(total_speculative_tokens) - len(current_batch_tokens),
+                    'token_count': len(current_batch_tokens),
+                    'prefix_version': current_n_past,
                 }
                 payload_bytes = msgpack.packb(payload)
                 # 将本轮所有推测token的索引计入“已验证”集合（避免重复计数）
-                new_indices = [idx for idx in total_speculative_indices if idx not in self._spec_token_indices_sent]
-                self._spec_token_indices_sent.update(new_indices)
-                self.num_spec_tokens_sent += len(new_indices)
+                self._mark_sent(total_speculative_indices)
+                self._trace_batch(
+                    phase='draft',
+                    batch_size=len(current_batch_tokens),
+                    planned_size=active_planned_size,
+                    plan_index=active_plan_index,
+                    window_id=merge_window_id,
+                    batch_id=merge_batch_id,
+                    token_start_index=payload['index'],
+                    should_verify=True,
+                    flush_reason='eos' if should_end else 'nav',
+                )
+                merge_plan_index = 0
+                merge_window_id += 1
+                merge_batch_id = 0
 
                 # print(f"[DEBUG] 发送验证请求，tokens: {current_batch_tokens}, n_past: {current_n_past}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
 
@@ -548,6 +694,8 @@ class Decoding(ABC):
                     PROPOSE_ENDPOINT,
                     payload_bytes,
                     headers={"Content-Type": "application/msgpack"},
+                    token_count=len(current_batch_tokens),
+                    measurement_kind="nav",
                 )
                 verify_result = None
                 
@@ -560,33 +708,51 @@ class Decoding(ABC):
                 waiting_futures = []
                 waiting_batch_tokens = None
                 waiting_batch_probs = None
+                waiting_batch_indices = None
                 should_verify_waiting = False
                 waiting_verify_future = None
-                
+                waiting_plan_batches = list(merge_plan_batches)
+                waiting_plan_index = 0
+                waiting_window_id = 0
+                waiting_batch_id = 0
+                waiting_pending_tokens = []
+                waiting_pending_probs = []
+                waiting_pending_indices = []
+                waiting_accumulated_probs = None
+                nav_returned = False
+                self._speculative_round_id += 1
+
                 while self.send_while_generating and len(output_tokens) + len(total_speculative_tokens) + len(waiting_tokens) < self.max_len:
 
                     if not waiting_tokens:
+                        speculative_final_step_start = time.perf_counter()
                         speculated_final_token = self.draft_model.sample(top_k=self.top_k, top_p=self.top_p, temp=self.temp)
                         self.draft_model.eval([speculated_final_token])
+                        self._observe_generation_time(
+                            1,
+                            time.perf_counter() - speculative_final_step_start,
+                        )
+                        self._apply_compute_emulation()
                         self.num_spec_tokens_generated += 1
                         self._spec_token_indices_generated.append(self.num_spec_tokens_generated)
                     
+                    waiting_step_start = time.perf_counter()
                     wait_token = self.draft_model.sample(top_k=self.top_k, top_p=self.top_p, temp=self.temp)
                     wait_probs = softmax(self.draft_model.scores[self.draft_model.n_tokens-1])
                     self.num_spec_tokens_generated += 1
                     self._spec_token_indices_generated.append(self.num_spec_tokens_generated)
                     
                     # eval这个等待token
-                    wait_eval_start = time.time()
                     self.draft_model.eval([wait_token])
-                    wait_eval_time = time.time() - wait_eval_start
-                    if wait_eval_time < self.args.default_token_compute:
-                        time.sleep(self.args.default_token_compute - wait_eval_time)
-                    self._observe_generation_time(1, time.time() - wait_eval_start)
+                    self._observe_generation_time(1, time.perf_counter() - waiting_step_start)
+                    self._apply_compute_emulation()
                     
                     waiting_tokens.append(wait_token)
                     waiting_probs.append(wait_probs)
                     waiting_indices.append(self._spec_token_indices_generated[-1])
+                    waiting_pending_tokens.append(wait_token)
+                    waiting_pending_probs.append(wait_probs)
+                    waiting_pending_indices.append(self._spec_token_indices_generated[-1])
                     
                     if 'edgeLLM' in self.algorithm:
                         self.verify_thresh_multi = self.alpha  # edgeLLM中多项式阈值等于alpha
@@ -595,12 +761,14 @@ class Decoding(ABC):
                         waiting_probs,
                         self.verify_strategy
                     )
+                    waiting_accumulated_probs = self.accumulated_probs
                     should_verify_waiting = should_verify_waiting or self._must_verify_for_budget(
                         output_tokens,
                         total_speculative_tokens,
                         waiting_tokens,
                     )
-                    
+                    should_verify_waiting = should_verify_waiting or wait_token == self.draft_model.token_eos()
+
                     if future.done():
                         verify_result = future.result()
                         if 'error' in verify_result or 'n_accepted' not in verify_result or 'final_token' not in verify_result:
@@ -610,37 +778,76 @@ class Decoding(ABC):
                         final_token = verify_result['final_token']
                         if not (n_accepted == len(total_speculative_tokens) and final_token == speculated_final_token):
                             break
+                        nav_returned = True
 
-                    waiting_payload = {
-                        'type': 'propose_waiting',
-                        'tokens': [wait_token],
-                        'probs': [wait_probs.tolist()],
-                        'task_id': task_id,
-                        'n_past': current_n_past + len(total_speculative_tokens) + 1,  # 更新n_past
-                        'index': len(waiting_tokens) - 1,  # 更新索引
-                        'should_verify': should_verify_waiting,  # 非验证请求
-                    }
-                    waiting_payload_bytes = msgpack.packb(waiting_payload)
-                    if should_verify_waiting:
-                        # 触发等待验证时，计入当前等待序列的索引
-                        new_indices_wait = [idx for idx in waiting_indices if idx not in self._spec_token_indices_sent]
-                        self._spec_token_indices_sent.update(new_indices_wait)
-                        self.num_spec_tokens_sent += len(new_indices_wait)
-                    
-                    # 异步发送等待期间的批次
-                    waiting_future = self.sender.submit(
-                        PROPOSE_ENDPOINT,
-                        waiting_payload_bytes,
-                        headers={"Content-Type": "application/msgpack"},
-                        tag=waiting_tag,
-                        token_count=None if should_verify_waiting else 1,
+                    planned_waiting_size = waiting_plan_batches[waiting_plan_index]
+                    should_flush_waiting = (
+                        len(waiting_pending_tokens) >= planned_waiting_size
+                        or should_verify_waiting
+                        or nav_returned
                     )
-                    waiting_futures.append(waiting_future)
-                    if should_verify_waiting:
-                        waiting_verify_future = waiting_future
-                    # print(f"[DEBUG] 发送等待期间的批次请求，tokens: {wait_token}, n_past: {current_n_past + len(total_speculative_tokens) + 1}， tokens: {self.draft_model.detokenize(waiting_tokens).decode('utf-8', 'ignore')}, should_verify: {should_verify_waiting}")
+                    if should_flush_waiting:
+                        waiting_batch_tokens = list(waiting_pending_tokens)
+                        waiting_batch_probs = list(waiting_pending_probs)
+                        waiting_batch_indices = list(waiting_pending_indices)
+                        waiting_start_index = len(waiting_tokens) - len(waiting_batch_tokens)
+                        waiting_payload = {
+                            'type': 'propose_waiting',
+                            'tokens': waiting_batch_tokens,
+                            'probs': [p.tolist() for p in waiting_batch_probs],
+                            'task_id': task_id,
+                            'n_past': current_n_past + len(total_speculative_tokens) + 1,
+                            'index': waiting_start_index,
+                            'should_verify': should_verify_waiting,
+                            'speculative_round_id': self._speculative_round_id,
+                            'window_id': waiting_window_id,
+                            'batch_id': waiting_batch_id,
+                            'token_start_index': waiting_start_index,
+                            'token_count': len(waiting_batch_tokens),
+                            'prefix_version': current_n_past,
+                            'expected_prefix_token': speculated_final_token,
+                            'parent_round_id': nav_round_id,
+                        }
+                        waiting_payload_bytes = msgpack.packb(waiting_payload)
+                        self._mark_sent(waiting_batch_indices)
+                        flush_reason = None
+                        if should_verify_waiting:
+                            flush_reason = 'waiting_nav'
+                        elif nav_returned:
+                            flush_reason = 'nav_returned'
+                        self._trace_batch(
+                            phase='waiting_nav',
+                            batch_size=len(waiting_batch_tokens),
+                            planned_size=planned_waiting_size,
+                            plan_index=waiting_plan_index,
+                            window_id=waiting_window_id,
+                            batch_id=waiting_batch_id,
+                            token_start_index=waiting_start_index,
+                            should_verify=should_verify_waiting,
+                            flush_reason=flush_reason,
+                        )
+                        waiting_future = self.proactive_sender.submit(
+                            PROPOSE_ENDPOINT,
+                            waiting_payload_bytes,
+                            headers={"Content-Type": "application/msgpack"},
+                            tag=waiting_tag,
+                            token_count=len(waiting_batch_tokens),
+                            measurement_kind="nav" if should_verify_waiting else "transport",
+                        )
+                        waiting_futures.append(waiting_future)
+                        if should_verify_waiting:
+                            waiting_verify_future = waiting_future
+                        waiting_pending_tokens = []
+                        waiting_pending_probs = []
+                        waiting_pending_indices = []
+                        previous_waiting_plan_index = waiting_plan_index
+                        waiting_plan_index = next_plan_index(waiting_plan_index, waiting_plan_batches)
+                        waiting_batch_id += 1
+                        if waiting_plan_index == 0 and previous_waiting_plan_index == len(waiting_plan_batches) - 1:
+                            waiting_window_id += 1
+                            waiting_batch_id = 0
 
-                    if should_verify_waiting or wait_token == self.draft_model.token_eos():
+                    if should_verify_waiting or nav_returned:
                         break
                 
                 if verify_result is None:
@@ -658,7 +865,7 @@ class Decoding(ABC):
                 self.verify_accept_lengths.append(n_accepted)
                 self.verify_his.append((len(total_speculative_tokens), n_accepted))
                 self._observe_completed_draft_round(len(total_speculative_tokens))
-                merge_plan_batches = self._resolve_merge_plan()
+                merge_plan_batches = self._resolve_algorithm_batch_plan()
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
@@ -682,123 +889,107 @@ class Decoding(ABC):
                 
                 if self.verify_strategy == 'multiple-tokens':
                     # 更新多项式阈值
-                    self.update_thresh(multiply_times=self.multiply_times, n_accepted=n_accepted, n_all=len(total_speculative_tokens))
+                    self.update_thresh(
+                        multiply_times=self.multiply_times,
+                        n_accepted=n_accepted,
+                        n_all=len(total_speculative_tokens),
+                        accumulated_probs=nav_accumulated_probs,
+                    )
                     # print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
                 
                 verify_result = None  # 重置验证结果
                 
                 
                 # --- 5. 处理等待期间生成的token ---
-                # print(f"[DEBUG] 验证期间生成了 {len(waiting_tokens)} 个token，n_accepted={n_accepted}")
-                waiting_batch_future = None
                 if len(output_tokens) >= self.max_len:
                     for fut in waiting_futures:
                         if not fut.done():
-                            self.sender.cancel_future(fut)
-                    self.sender.drain_tag(waiting_tag)
+                            self.proactive_sender.cancel_future(fut)
+                    self.proactive_sender.drain_tag(waiting_tag)
                     waiting_tokens = []
                 if waiting_tokens:
-                    # print(f"[DEBUG] final_token: {final_token}, speculated_final_token: {speculated_final_token}, n_accepted: {n_accepted}, total_speculative_tokens: {len(total_speculative_tokens)}")
-                    # 仅重打包那些尚未出队发送的等待请求：排除已完成/已取消/已 in-flight 的 future
-                    pending_indices = []
-                    for idx, fut in enumerate(waiting_futures):
-                        if fut.done() or fut.cancelled():
-                            continue
-                        try:
-                            inflight = self.sender.is_inflight_future(fut)
-                        except Exception:
-                            inflight = False
-                        if inflight:
-                            continue
-                        pending_indices.append(idx)
                     if last_verify_all_passed:
                         if should_verify_waiting:
-                            if pending_indices:
-                                for idx in pending_indices:
-                                    fut = waiting_futures[idx]
-                                    if not fut.done():
-                                        self.sender.cancel_future(fut)
-                                drained_requests = self.sender.drain_tag(waiting_tag)
-                                # if drained_requests:
-                                    # print(f"[DEBUG] 取消等待期间挂起的 {len(drained_requests)} 个请求以重新打包")
-                                waiting_batch_tokens = [waiting_tokens[idx] for idx in pending_indices]
-                                waiting_batch_probs = [waiting_probs[idx] for idx in pending_indices]
-                                waiting_batch_payload = {
-                                    'type': 'propose_waiting',
-                                    'tokens': waiting_batch_tokens.copy(),
-                                    'probs': [p.tolist() for p in waiting_batch_probs],
-                                    'task_id': task_id,
-                                    'n_past': current_n_past,
-                                    'index': len(waiting_tokens) - len(waiting_batch_tokens),
-                                    'should_verify': True,
-                                }
-                                waiting_batch_bytes = msgpack.packb(waiting_batch_payload)
-                                waiting_batch_indices = [waiting_indices[idx] for idx in pending_indices]
-                                new_indices_wait_batch = [idx for idx in waiting_batch_indices if idx not in self._spec_token_indices_sent]
-                                self._spec_token_indices_sent.update(new_indices_wait_batch)
-                                self.num_spec_tokens_sent += len(new_indices_wait_batch)
-                                waiting_batch_future = self.sender.submit(
-                                    PROPOSE_ENDPOINT,
-                                    waiting_batch_bytes,
-                                    headers={"Content-Type": "application/msgpack"},
-                                    tag=f"{waiting_tag}_batch",
-                                )
-                                waiting_futures = [waiting_futures[idx] for idx in range(len(waiting_futures)) if idx not in pending_indices]
-                                waiting_futures.append(waiting_batch_future)
+                            if waiting_verify_future is None:
+                                raise RuntimeError("waiting NAV was requested without a flushed verification batch")
+                            verify_result_waiting = waiting_verify_future.result()
+                            if 'n_accepted' not in verify_result_waiting:
+                                if self._is_discarded_proactive_response(verify_result_waiting):
+                                    self.color_print(
+                                        "[Edge] waiting NAV 已失效，丢弃等待期草稿并恢复到父 NAV 的已验证前缀。",
+                                        3,
+                                    )
+                                    current_n_past = self._rollback_discarded_waiting_round(output_tokens)
+                                    waiting_tokens = []
+                                else:
+                                    raise RuntimeError(
+                                        f"invalid waiting NAV response: {verify_result_waiting}"
+                                    )
                             else:
-                                waiting_batch_future = waiting_verify_future
-                                # print("[DEBUG] 等待请求已全部完成，跳过重新打包")
+                                n_accepted_waiting = verify_result_waiting['n_accepted']
+                                final_token_waiting = verify_result_waiting['final_token']
+                                waiting_spec_len = len(waiting_tokens)
+                                self.verify_spec_lengths.append(waiting_spec_len)
+                                self.verify_accept_lengths.append(n_accepted_waiting)
+                                self.verify_his.append((waiting_spec_len, n_accepted_waiting))
+                                self._observe_completed_draft_round(waiting_spec_len)
+                                merge_plan_batches = self._resolve_algorithm_batch_plan()
+                                if waiting_spec_len > 0:
+                                    self.acc_ratio += n_accepted_waiting / waiting_spec_len
+                                self._commit_verified_tokens(
+                                    output_tokens,
+                                    waiting_tokens,
+                                    n_accepted_waiting,
+                                    final_token_waiting,
+                                )
+                                self.draft_model.reset()
+                                self.draft_model.eval(output_tokens)
+                                current_n_past = self.draft_model.n_tokens
+                                if self.verify_strategy == 'multiple-tokens':
+                                    self.update_thresh(
+                                        multiply_times=self.multiply_times,
+                                        n_accepted=n_accepted_waiting,
+                                        n_all=waiting_spec_len,
+                                        accumulated_probs=waiting_accumulated_probs,
+                                    )
+                                self._speculative_round_id += 1
                         else:
-                            total_speculative_tokens = waiting_tokens
-                            total_speculative_probs = waiting_probs
-                            total_speculative_indices = waiting_indices
-                            current_batch_tokens = []
-                            current_batch_probs = []
-                            current_batch_indices = []
-                            # print(f"[DEBUG] 全部接受，使用等待期间的 {len(waiting_tokens)} 个token作为新推测")
+                            # The cloud has buffered exactly these proactive batches.  Keep
+                            # the edge sequence and continue the same speculative round.
+                            # Join only at the round boundary: generation and upload were
+                            # concurrent throughout NAV, but later primary-channel batches
+                            # must not overtake an earlier proactive upload.
+                            proactive_round_valid = True
+                            for proactive_future in waiting_futures:
+                                proactive_result = proactive_future.result()
+                                if isinstance(proactive_result, dict) and 'error' in proactive_result:
+                                    raise RuntimeError(
+                                        f"proactive upload failed: {proactive_result}"
+                                    )
+                                if self._is_discarded_proactive_response(proactive_result):
+                                    proactive_round_valid = False
+                            if proactive_round_valid:
+                                total_speculative_tokens = list(waiting_tokens)
+                                total_speculative_probs = list(waiting_probs)
+                                total_speculative_indices = list(waiting_indices)
+                                current_batch_tokens = []
+                                current_batch_probs = []
+                                current_batch_indices = []
+                                merge_plan_index = 0 if nav_returned else waiting_plan_index
+                                merge_window_id = waiting_window_id
+                                merge_batch_id = waiting_batch_id
+                            else:
+                                self.color_print(
+                                    "[Edge] proactive batch 已失效，回退到父 NAV 的已验证前缀。",
+                                    3,
+                                )
+                                current_n_past = self._rollback_discarded_waiting_round(output_tokens)
+                                waiting_tokens = []
                     else:
                         for fut in waiting_futures:
                             if not fut.done():
-                                self.sender.cancel_future(fut)
-                        drained_requests = self.sender.drain_tag(waiting_tag)
-                        # if drained_requests:
-                        #     print(f"[DEBUG] 验证未通过，取消等待期间的 {len(drained_requests)} 个挂起请求")
-
-                    if waiting_batch_future is not None and should_verify_waiting:
-                        verify_result_waiting = waiting_batch_future.result()
-                        if 'n_accepted' not in verify_result_waiting:
-                            print(f"[Edge] 服务器返回错误: {verify_result_waiting}")
-                            return
-                        n_accepted_waiting = verify_result_waiting['n_accepted']
-                        final_token_waiting = verify_result_waiting['final_token']
-                        waiting_spec_len = self._resolve_waiting_verify_length(
-                            waiting_tokens=waiting_tokens,
-                            waiting_batch_tokens=waiting_batch_tokens,
-                        )
-                        self.verify_spec_lengths.append(waiting_spec_len)
-                        self.verify_accept_lengths.append(n_accepted_waiting)
-                        self.verify_his.append((waiting_spec_len, n_accepted_waiting))
-                        self._observe_completed_draft_round(waiting_spec_len)
-                        merge_plan_batches = self._resolve_merge_plan()
-                        if waiting_spec_len > 0:
-                            self.acc_ratio += n_accepted_waiting / waiting_spec_len
-                        self._commit_verified_tokens(
-                            output_tokens,
-                            waiting_tokens,
-                            n_accepted_waiting,
-                            final_token_waiting,
-                        )
-                        # The waiting branch may have advanced llama.cpp's KV cache beyond
-                        # the accepted prefix. Rebuild from the committed output to keep
-                        # n_tokens and the internal cache consistent before continuing.
-                        self.draft_model.reset()
-                        self.draft_model.eval(output_tokens)
-                        current_n_past = self.draft_model.n_tokens
-                        # print(f"[DEBUG] 重构批次全部接受，更新状态: n_past {current_n_past - n_accepted_waiting - 1} -> {current_n_past}, final_token {final_token_waiting}")
-                        if self.verify_strategy == 'multiple-tokens':
-                            # 更新多项式阈值
-                            self.update_thresh(multiply_times=self.multiply_times, n_accepted=n_accepted_waiting, n_all=len(waiting_tokens))
-                            # print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
+                                self.proactive_sender.cancel_future(fut)
+                        self.proactive_sender.drain_tag(waiting_tag)
 
                 if not (last_verify_all_passed and not should_verify_waiting and waiting_tokens):
                     total_speculative_tokens = []
@@ -824,6 +1015,12 @@ class Decoding(ABC):
                     'n_past': current_n_past,  # 使用当前的n_past
                     'index': len(total_speculative_tokens) - len(current_batch_tokens),  # 当前批次的索引
                     'should_verify': False,  # 非验证请求
+                    'speculative_round_id': self._speculative_round_id,
+                    'window_id': merge_window_id,
+                    'batch_id': merge_batch_id,
+                    'token_start_index': len(total_speculative_tokens) - len(current_batch_tokens),
+                    'token_count': len(current_batch_tokens),
+                    'prefix_version': current_n_past,
                 }
                 payload_bytes = msgpack.packb(payload)
 
@@ -835,17 +1032,36 @@ class Decoding(ABC):
                     payload_bytes,
                     headers={"Content-Type": "application/msgpack"},
                     token_count=len(current_batch_tokens),
+                    measurement_kind="transport",
+                )
+                self._mark_sent(current_batch_indices)
+                self._trace_batch(
+                    phase='draft',
+                    batch_size=len(current_batch_tokens),
+                    planned_size=merge_plan_batches[merge_plan_index],
+                    plan_index=merge_plan_index,
+                    window_id=merge_window_id,
+                    batch_id=merge_batch_id,
+                    token_start_index=payload['index'],
+                    should_verify=False,
                 )
 
                 # 重置当前批次
                 current_batch_tokens = []
                 current_batch_probs = []
                 current_batch_indices = []
-                merge_plan_index = min(merge_plan_index + 1, len(merge_plan_batches) - 1)
+                previous_plan_index = merge_plan_index
+                merge_plan_index = next_plan_index(merge_plan_index, merge_plan_batches)
+                merge_batch_id += 1
+                if merge_plan_index == 0 and previous_plan_index == len(merge_plan_batches) - 1:
+                    merge_window_id += 1
+                    merge_batch_id = 0
 
         total_end_time = time.time()
         spent_time = total_end_time - total_start_time
-        self.color_print(f"[Edge] 任务 {task_id} 处理完成，输出长度 {len(output_tokens) - prefix_len}，总耗时: {spent_time:.4f} 秒, 单位token耗时 {spent_time / (len(output_tokens) - prefix_len):.4f} 秒", 5)
+        completed_output_length = len(output_tokens) - prefix_len
+        tpt = spent_time / completed_output_length if completed_output_length else float('inf')
+        self.color_print(f"[Edge] 任务 {task_id} 处理完成，输出长度 {completed_output_length}，总耗时: {spent_time:.4f} 秒, 单位token耗时 {tpt:.4f} 秒", 5)
 
         decoded_text = self.draft_model.detokenize(output_tokens).decode("utf-8", "ignore")
         post_result = self.postprocess(prefix, decoded_text)
@@ -855,8 +1071,15 @@ class Decoding(ABC):
             'num_spec_tokens_sent': self.num_spec_tokens_sent,
             'num_spec_tokens_generated': self.num_spec_tokens_generated,
             'num_spec_tokens': self.num_spec_tokens_sent,
+            'unique_generated_token_indices': len(set(self._spec_token_indices_generated)),
+            'unique_sent_token_indices': len(self._spec_token_indices_sent),
         }
+        if self.num_spec_tokens_sent > self.num_spec_tokens_generated:
+            raise RuntimeError("sent speculative-token count exceeds generated-token count")
 
+        # Drain proactive uploads before deleting cloud task state so exit
+        # metrics include every reused/discarded batch.
+        self.proactive_sender.close()
         exit_payload = msgpack.packb({'type': 'exit', 'task_id': task_id})
         exit_result = self.sender.submit(
             EXIT_ENDPOINT,
@@ -870,7 +1093,7 @@ class Decoding(ABC):
 
         os.makedirs(self.exp_name, exist_ok=True) 
         output_length = len(output_tokens) - prefix_len
-        avg_token_time = float(sum(self._token_durations) / len(self._token_durations)) if self._token_durations else None
+        avg_token_time = spent_time / output_length if output_length else None
         diagnostics = self._build_verify_diagnostics(output_length)
         exp_result = {
             'task_id': task_id,
@@ -882,24 +1105,43 @@ class Decoding(ABC):
             'process_started_at': self.process_started_at,
             'process_model_ready_at': self.process_model_ready_at,
             'output': decoded_text,
+            'generated_text': decoded_text[len(prefix):] if decoded_text.startswith(prefix) else decoded_text,
+            'processed_output': post_result,
             'gamma': self.gamma,
             'max_len': self.max_len,
+            'requested_output_tokens': generation_budget,
+            'ended_with_eos': bool(output_tokens and output_tokens[-1] == self.draft_model.token_eos()),
+            'generation_cap_hit': bool(
+                generation_budget == self.max_generated_len
+                and completed_output_length == self.max_generated_len
+                and output_tokens
+                and output_tokens[-1] != self.draft_model.token_eos()
+            ),
             'strategy': self.verify_strategy,
             'merge_policy': self.merge_policy,
             'bandwidth_MBps': self.bandwidth_MBps,
             'thresh_single': self.verify_thresh_single,
             'thresh_multi': self.verify_thresh_multi,
             'verify_stats': verify_stats,
-            'token_durations': self._token_durations,
+            'token_durations': list(self._sample_token_durations),
             'avg_token_time': avg_token_time,
             'gpu_power_integral_joules': exit_result.get('gpu_power_integral_joules', None),
             'verify_num': exit_result.get('verify_num', None),
+            'cloud_cache_version': exit_result.get('cache_version'),
+            'discarded_proactive_tokens': exit_result.get('discarded_proactive_tokens', 0),
+            'reused_proactive_tokens': exit_result.get('reused_proactive_tokens', 0),
             'acc_ratio': self.acc_ratio / len(self.verify_spec_lengths) if self.verify_spec_lengths else 0.0,
             'verify_spec_lengths': self.verify_spec_lengths,
             'verify_accept_lengths': self.verify_accept_lengths,
             'verify_his': self.verify_his,
             'diagnostics': diagnostics,
             'environment_measurements': self._environment_snapshot(),
+            'batch_trace': self.batch_trace,
+            'compute_emulation': {
+                'enabled': bool(getattr(self.args, 'enable_compute_emulation', False)),
+                'extra_delay_seconds': float(getattr(self.args, 'emulated_generation_delay', 0.0)),
+                'initial_generation_gamma': float(getattr(self.dp_scheduler, 'gamma', 0.0)),
+            },
         }
         if not persist_result:
             self.sender.close()

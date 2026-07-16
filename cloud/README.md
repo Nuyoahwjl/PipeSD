@@ -21,6 +21,7 @@ The service binds to port `8000` by default (see `APP_PORT` in `src/speculative_
 
 ## API endpoints (high level)
 - `POST /init`: initialize a task with a token prefix
+- `POST /start`: start full-task generation energy accounting after prefill/bootstrap
 - `POST /propose`: send speculative tokens and/or trigger verification
 - `POST /exit`: finalize a task and return aggregated metrics
 - `GET /health`: service status

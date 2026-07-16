@@ -68,7 +68,7 @@ def build_paths(args):
         "vanilla": base / "vanilla" / f"gamma_{args.vanilla_gamma}{tag}_bw={bw}MB.json",
         "hsl": base / "hsl" / f"st={args.hsl_thresh}{tag}_bw={bw}MB.json",
         "pipesd": base / "pipesd" / f"st={args.pipesd_single_thresh}_mt={args.pipesd_multi_thresh}_merge=dp{tag}_bw={bw}MB.json",
-        "edgeLLM": base / "edgeLLM" / f"edgeLLM_alpha={args.edgellm_init_alpha}_mult={args.edgellm_multiply_times}{tag}_bw={bw}MB.json",
+        "edgeLLM": base / "edgeLLM" / f"edgeLLM_alpha={args.edgellm_init_alpha}_decay={args.edgellm_full_accept_decay}{tag}_bw={bw}MB.json",
     }
 
 
@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--pipesd_single_thresh", type=float, default=0.9)
     parser.add_argument("--pipesd_multi_thresh", type=float, default=0.95)
     parser.add_argument("--edgellm_init_alpha", type=float, default=0.92)
-    parser.add_argument("--edgellm_multiply_times", type=float, default=0.95)
+    parser.add_argument("--edgellm_full_accept_decay", type=float, default=0.5)
     parser.add_argument("--output_json", default="")
     args = parser.parse_args()
 

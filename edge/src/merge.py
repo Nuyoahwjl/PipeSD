@@ -3,6 +3,13 @@ from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
 
 
+def next_plan_index(current_index: int, plan: List[int]) -> int:
+    """Advance a batch plan cyclically across consecutive scheduling windows."""
+    if not plan:
+        raise ValueError("plan must contain at least one batch")
+    return (int(current_index) + 1) % len(plan)
+
+
 def dynamic_token_scheduling_dp(
     token_compute_times: List[float],
     C: float,
@@ -78,14 +85,28 @@ class PaperDPScheduler:
     """Online scheduler matching Algorithm 1 and Appendix D.2 of PipeSD."""
 
     def __init__(self, alpha: float, beta: float, gamma: float, initial_window: int = 20,
-                 history_size: int = 100, update_threshold: float = 0.2) -> None:
+                 history_size: int = 100, update_threshold: Optional[float] = None,
+                 gamma_update_threshold: float = 0.2,
+                 communication_update_threshold: float = 0.2) -> None:
         if initial_window <= 0 or history_size <= 0:
             raise ValueError("window sizes must be positive")
         self.alpha, self.beta, self.gamma = float(alpha), float(beta), float(gamma)
-        self.window = int(initial_window)
-        self.update_threshold = float(update_threshold)
+        self.initial_window = int(initial_window)
+        self.window = self.initial_window
+        if update_threshold is not None:
+            gamma_update_threshold = update_threshold
+            communication_update_threshold = update_threshold
+        self.gamma_update_threshold = float(gamma_update_threshold)
+        self.communication_update_threshold = float(communication_update_threshold)
         self.draft_lengths: Deque[int] = deque(maxlen=history_size)
         self._plan: Optional[List[int]] = None
+        self.update_history: Deque[Dict[str, object]] = deque(maxlen=history_size)
+
+    def reset_workload_history(self) -> None:
+        """Reset candidate-specific draft-length state without discarding environment estimates."""
+        self.draft_lengths.clear()
+        self.window = self.initial_window
+        self._plan = None
 
     @staticmethod
     def _relative_change(old: float, new: float) -> float:
@@ -107,8 +128,21 @@ class PaperDPScheduler:
         proposed = {"alpha": self.alpha if alpha is None else float(alpha),
                     "beta": self.beta if beta is None else float(beta),
                     "gamma": self.gamma if gamma is None else float(gamma)}
-        changed = any(self._relative_change(getattr(self, name), value) > self.update_threshold
-                      for name, value in proposed.items())
+        relative_changes = {
+            name: self._relative_change(getattr(self, name), value)
+            for name, value in proposed.items()
+        }
+        changed = (
+            relative_changes['gamma'] > self.gamma_update_threshold
+            or relative_changes['alpha'] > self.communication_update_threshold
+            or relative_changes['beta'] > self.communication_update_threshold
+        )
+        self.update_history.append({
+            'old': {'alpha': self.alpha, 'beta': self.beta, 'gamma': self.gamma},
+            'new': dict(proposed),
+            'relative_change': relative_changes,
+            'triggered': changed,
+        })
         if changed:
             self.alpha, self.beta, self.gamma = proposed["alpha"], proposed["beta"], proposed["gamma"]
             self._plan = None
@@ -129,6 +163,9 @@ class PaperDPScheduler:
             "window": self.window,
             "plan": self.plan(),
             "draft_length_history_size": len(self.draft_lengths),
+            "gamma_update_threshold": self.gamma_update_threshold,
+            "communication_update_threshold": self.communication_update_threshold,
+            "last_parameter_update": self.update_history[-1] if self.update_history else None,
         }
 
 
@@ -161,6 +198,19 @@ class OnlineEnvironmentEstimator:
 
     def estimate(self) -> Dict[str, float]:
         estimates: Dict[str, float] = {}
+        regression = self.communication_regression()
+        if regression is not None:
+            estimates["alpha"] = regression["alpha"]
+            estimates["beta"] = regression["beta"]
+
+        total_generated_tokens = sum(count for count, _ in self.generation_samples)
+        total_generation_time = sum(elapsed for _, elapsed in self.generation_samples)
+        if total_generated_tokens > 0 and total_generation_time > 0:
+            estimates["gamma"] = total_generation_time / total_generated_tokens
+
+        return estimates
+
+    def communication_regression(self) -> Optional[Dict[str, object]]:
         raw_comm = list(self.comm_samples)
         grouped: Dict[int, List[float]] = {}
         for count, elapsed in raw_comm:
@@ -170,7 +220,9 @@ class OnlineEnvironmentEstimator:
             for count, elapsed_values in sorted(grouped.items())
         ]
         required_distinct_sizes = min(self.min_comm_samples, 8)
-        if len(raw_comm) >= self.min_comm_samples and len(comm) >= required_distinct_sizes:
+        is_initial_bootstrap = len(raw_comm) == self.min_comm_samples
+        is_full_runtime_window = len(raw_comm) >= self.history_size
+        if (is_initial_bootstrap or is_full_runtime_window) and len(comm) >= required_distinct_sizes:
             n = float(len(comm))
             sum_x = sum(float(count) for count, _ in comm)
             sum_y = sum(elapsed for _, elapsed in comm)
@@ -180,15 +232,22 @@ class OnlineEnvironmentEstimator:
             if denominator > 0:
                 beta = (n * sum_xy - sum_x * sum_y) / denominator
                 alpha = (sum_y - beta * sum_x) / n
-                estimates["alpha"] = max(0.0, alpha)
-                estimates["beta"] = max(1e-9, beta)
-
-        total_generated_tokens = sum(count for count, _ in self.generation_samples)
-        total_generation_time = sum(elapsed for _, elapsed in self.generation_samples)
-        if total_generated_tokens > 0 and total_generation_time > 0:
-            estimates["gamma"] = total_generation_time / total_generated_tokens
-
-        return estimates
+                fitted = [alpha + beta * count for count, _ in comm]
+                residuals = [elapsed - predicted for (_, elapsed), predicted in zip(comm, fitted)]
+                mean_y = sum_y / n
+                ss_res = sum(value * value for value in residuals)
+                ss_tot = sum((elapsed - mean_y) ** 2 for _, elapsed in comm)
+                r_squared = 1.0 if ss_tot == 0 and ss_res == 0 else (0.0 if ss_tot == 0 else 1.0 - ss_res / ss_tot)
+                return {
+                    "alpha": max(0.0, alpha),
+                    "beta": max(1e-9, beta),
+                    "r_squared": float(r_squared),
+                    "residuals": residuals,
+                    "samples_per_batch_size": {str(count): len(grouped[count]) for count, _ in comm},
+                    "mean_seconds_per_batch_size": {str(count): elapsed for count, elapsed in comm},
+                    "window_full": is_full_runtime_window,
+                }
+        return None
 
     def snapshot(self) -> Dict[str, object]:
         return {
@@ -197,6 +256,7 @@ class OnlineEnvironmentEstimator:
             "distinct_comm_batch_sizes": sorted({count for count, _ in self.comm_samples}),
             "min_comm_samples": self.min_comm_samples,
             "estimate": self.estimate(),
+            "communication_regression": self.communication_regression(),
         }
 
 

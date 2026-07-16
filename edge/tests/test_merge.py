@@ -55,6 +55,18 @@ class MergeModuleTests(unittest.TestCase):
         self.assertFalse(scheduler.update_parameters(alpha=1.2))
         self.assertTrue(scheduler.update_parameters(alpha=1.21))
 
+    def test_plan_index_cycles_across_windows(self):
+        from src.merge import next_plan_index
+
+        plan = [1, 3, 8]
+        index = 0
+        observed = []
+        for _ in range(7):
+            observed.append(plan[index])
+            index = next_plan_index(index, plan)
+
+        self.assertEqual(observed, [1, 3, 8, 1, 3, 8, 1])
+
     def test_online_environment_estimator_regresses_comm_and_generation(self):
         from src.merge import OnlineEnvironmentEstimator
 

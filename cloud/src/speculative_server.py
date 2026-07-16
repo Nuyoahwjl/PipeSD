@@ -47,6 +47,10 @@ class InitRequest(BaseModel):
     task_id: int
     tokens: List[int]
 
+
+class TaskRequest(BaseModel):
+    task_id: int
+
 class MyModel():
     def __init__(self, model_path: str, n_ctx: int):
         args = parse_arguments()
@@ -144,6 +148,16 @@ class InferenceTask:
         self.rng = np.random.default_rng(seed)
         
         self.last_verify_pass = False
+        # Verification must not hold ``self.lock`` while the target model is
+        # running.  Proactive requests use this condition to deposit the next
+        # round and, for a waiting-NAV request, wait for its parent NAV result.
+        self.verify_condition = threading.Condition(self.lock)
+        self.verify_in_progress = False
+        self.active_verify_round_id = None
+        self.last_completed_round_id = None
+        self.completed_verifications = {}
+        self.proactive_buffers = {}
+        self.promoted_parent_rounds = set()
         try:
             self.torch_generator = torch.Generator()
             self.torch_generator.manual_seed(seed)
@@ -152,6 +166,10 @@ class InferenceTask:
         self.total_gpu_power_integral_joules = 0.0
         self.last_verify_power_integral = 0.0
         self.veridy_num = 0
+        self.cache_version = 0
+        self.discarded_proactive_tokens = 0
+        self.reused_proactive_tokens = 0
+        self.task_energy_tracker = None
         # 记录每个绝对位置使用的随机数（用于接受判定或最终token采样）
         # 结构为列表，元素是 {'pos': int, 'rand': float, 'stage': str}
         self.rand_trace: List[Dict[str, object]] = []
@@ -173,9 +191,23 @@ class InferenceTask:
         consistency = True
 
     def _energy_context(self, stage: str):
+        if self.task_energy_tracker is not None:
+            return nullcontext()
         if not gpu_energy_monitor or not gpu_energy_monitor.enabled:
             return nullcontext()
         return EnergyTracker(gpu_energy_monitor, self, stage, POWER_SAMPLE_INTERVAL, logger=logger)
+
+    def start_energy_tracking(self):
+        if gpu_energy_monitor and gpu_energy_monitor.enabled and self.task_energy_tracker is None:
+            self.task_energy_tracker = EnergyTracker(
+                gpu_energy_monitor, self, "task_total", POWER_SAMPLE_INTERVAL, logger=logger
+            )
+            self.task_energy_tracker.__enter__()
+
+    def stop_energy_tracking(self):
+        tracker, self.task_energy_tracker = self.task_energy_tracker, None
+        if tracker is not None:
+            tracker.__exit__(None, None, None)
         
     def load_model(self):
         self.target_model = Llama(
@@ -193,8 +225,7 @@ class InferenceTask:
     def proc_prefix(self):
         shared_model.set_task(self.task_id)
         self.target_model.reset()
-        with self._energy_context("init_eval"):
-            self.target_model.eval(self.prefix)
+        self.target_model.eval(self.prefix)
         self.n_past = self.target_model.n_tokens
         self.save_model_state()
         return self.n_past == len(self.prefix)
@@ -233,7 +264,95 @@ class InferenceTask:
             self.accumulated_probs.extend([None] * gap)
         self.accumulated_tokens.extend(tokens)
         self.accumulated_probs.extend([np.array(p) for p in probs])
-        return index == len(self.accumulated_tokens)
+        return index + len(tokens) == len(self.accumulated_tokens)
+
+    @staticmethod
+    def _add_indexed(tokens_store, probs_store, tokens, probs, index):
+        """Insert an indexed batch into an arbitrary speculative buffer."""
+        if index < len(tokens_store):
+            del tokens_store[index:]
+            del probs_store[index:]
+        elif index > len(tokens_store):
+            gap = index - len(tokens_store)
+            tokens_store.extend([None] * gap)
+            probs_store.extend([None] * gap)
+        tokens_store.extend(tokens)
+        probs_store.extend([np.array(p) for p in probs])
+        return index + len(tokens) == len(tokens_store)
+
+    def buffer_proactive_batch(self, payload, tokens, probs, index):
+        """Store a next-round batch without touching the active NAV buffer."""
+        parent_round_id = payload.get('parent_round_id')
+        round_id = payload.get('speculative_round_id')
+        if parent_round_id is None and round_id is not None:
+            parent_round_id = int(round_id) - 1
+        if parent_round_id is None:
+            return None, False
+
+        parent_round_id = int(parent_round_id)
+        expected_prefix_token = payload.get('expected_prefix_token')
+        entry = self.proactive_buffers.setdefault(parent_round_id, {
+            'tokens': [],
+            'probs': [],
+            'expected_prefix_token': expected_prefix_token,
+            'round_id': round_id,
+            'prefix_version': payload.get('prefix_version'),
+        })
+        if (
+            entry['expected_prefix_token'] != expected_prefix_token
+            or entry['round_id'] != round_id
+            or entry['prefix_version'] != payload.get('prefix_version')
+        ):
+            return parent_round_id, False
+        added_contiguously = self._add_indexed(
+            entry['tokens'], entry['probs'], tokens, probs, index
+        )
+        return parent_round_id, added_contiguously
+
+    def proactive_parent_status(self, parent_round_id, expected_prefix_token):
+        """Return not_started, pending, valid, or invalid for a parent NAV.
+
+        A proactive request is allowed to overtake its parent NAV on the two
+        independent HTTP channels.  Such a future round must be buffered, not
+        treated as stale.  A missing round is stale only when the cloud has
+        already completed a later round.
+        """
+        if parent_round_id is None:
+            return 'invalid'
+        if parent_round_id == self.active_verify_round_id and self.verify_in_progress:
+            return 'pending'
+        result = self.completed_verifications.get(parent_round_id)
+        if result is None:
+            if (
+                self.last_completed_round_id is None
+                or int(parent_round_id) > int(self.last_completed_round_id)
+            ):
+                return 'not_started'
+            return 'invalid'
+        all_accepted = result.get('n_accepted') == result.get('n_speculative')
+        prefix_matches = (
+            expected_prefix_token is not None
+            and result.get('final_token') is not None
+            and int(expected_prefix_token) == int(result['final_token'])
+        )
+        return 'valid' if all_accepted and prefix_matches else 'invalid'
+
+    def discard_proactive_buffer(self, parent_round_id):
+        entry = self.proactive_buffers.pop(parent_round_id, None)
+        count = len([token for token in (entry or {}).get('tokens', []) if token is not None])
+        self.discarded_proactive_tokens += count
+        return count
+
+    def promote_proactive_buffer(self, parent_round_id):
+        entry = self.proactive_buffers.pop(parent_round_id, None)
+        if entry is None:
+            return 0
+        self.accumulated_tokens = list(entry['tokens'])
+        self.accumulated_probs = list(entry['probs'])
+        count = len([token for token in self.accumulated_tokens if token is not None])
+        self.reused_proactive_tokens += count
+        self.promoted_parent_rounds.add(parent_round_id)
+        return count
         
         # print(f"[DEBUG] Added batch: tokens={tokens}, index={index}, total_tokens={len([t for t in self.accumulated_tokens if t is not None])}")
 
@@ -270,7 +389,7 @@ class InferenceTask:
             logger.info(f"task={self.task_id} n_speculative={n_speculative} speculative_tokens={self.target_model.detokenize(speculative_tokens).decode('utf-8', 'ignore')}")
             logger.info(f"task={self.task_id} draft_probs_shape={draft_probs.shape}")
             
-            if self.final_token:
+            if self.final_token is not None:
                 final_len = 1
             else:
                 final_len = 0
@@ -281,7 +400,7 @@ class InferenceTask:
                 logger.info(f"覆盖之前的记录, n_past={n_past_at_verify}, n_tokens={self.target_model.n_tokens}")
 
             # 评估
-            eval_tokens = [self.final_token] + speculative_tokens if self.final_token else speculative_tokens
+            eval_tokens = [self.final_token] + speculative_tokens if self.final_token is not None else speculative_tokens
             self.target_model.eval(eval_tokens)
             
             # 获取目标概率
@@ -346,7 +465,7 @@ class InferenceTask:
                     logger.info(f"task={self.task_id} used model.sample (direct fallback) final_token={final_token}")
             
             # 更新并返回
-            new_n_past = self.target_model.n_tokens + n_accepted + 1
+            new_n_past = self.target_model.n_tokens + 1
             self.final_token = final_token
             self.reset_accumulated()
             logger.info(f"verify_tokens end: task={self.task_id} n_accepted={n_accepted} n_speculative={n_speculative} final_token={final_token} new_n_past={new_n_past}")
@@ -356,12 +475,14 @@ class InferenceTask:
             else:
                 self.last_verify_pass = False
                 self.reset_accumulated()
+            self.cache_version += 1
 
             return {
                 'n_accepted': n_accepted,
                 'n_speculative': n_speculative,
                 'final_token': final_token,
                 'n_past': new_n_past,
+                'cache_version': self.cache_version,
                 'gpu_power_integral': getattr(self, 'last_verify_power_integral', 0.0)
             }
     
@@ -391,6 +512,15 @@ def handle_init_request(request: InitRequest):
     return {'init': 'success', 'n_past': task.n_past}
 
 
+def handle_start_request(request: TaskRequest):
+    with active_tasks_lock:
+        task = active_tasks.get(request.task_id)
+    if task is None:
+        raise HTTPException(status_code=400, detail="Task not found or not initialized.")
+    with task.lock:
+        task.start_energy_tracking()
+    return {'status': 'started', 'task_id': request.task_id}
+
 def handle_propose_payload(payload):
     task_id = payload.get('task_id')
     with active_tasks_lock:
@@ -403,35 +533,164 @@ def handle_propose_payload(payload):
     should_verify = payload.get('should_verify', False)
     n_past_at_receive = payload.get('n_past', task.n_past)
 
-    with task.lock:
-        index = payload.get('index', len([t for t in task.accumulated_tokens if t is not None]))
+    is_proactive = payload.get('type') == 'propose_waiting'
+    round_id = payload.get('speculative_round_id')
 
-        if should_verify:
-            task.add_batch(tokens, probs, index)
+    if is_proactive:
+        with task.verify_condition:
+            index = payload.get('index', 0)
+            parent_round_id = payload.get('parent_round_id')
+            if parent_round_id is None and round_id is not None:
+                parent_round_id = int(round_id) - 1
+            if parent_round_id is not None:
+                parent_round_id = int(parent_round_id)
+            expected_prefix_token = payload.get('expected_prefix_token')
+            parent_status = (
+                task.proactive_parent_status(parent_round_id, expected_prefix_token)
+                if parent_round_id is not None else None
+            )
+            if (
+                parent_status == 'valid'
+                and parent_round_id in task.promoted_parent_rounds
+            ):
+                add_result = task.add_batch(tokens, probs, index)
+                task.reused_proactive_tokens += len(tokens)
+            else:
+                parent_round_id, add_result = task.buffer_proactive_batch(
+                    payload, tokens, probs, index
+                )
 
-            if payload.get('type') == 'propose_waiting':
-                logger.info(f"等待期间的验证,tokens: {tokens}")
-                if not task.last_verify_pass:
+            # Backward-compatible path for old clients without round metadata.
+            # New clients always send parent_round_id and take the concurrent path.
+            if parent_round_id is None:
+                valid = (
+                    task.last_verify_pass
+                    and expected_prefix_token is not None
+                    and task.final_token is not None
+                    and int(expected_prefix_token) == int(task.final_token)
+                )
+                if not valid:
+                    task.discarded_proactive_tokens += len(tokens)
                     return {
-                        'status': 'last verify failed, drop',
+                        'status': 'discarded_stale_proactive_batch',
                         'n_past': task.n_past,
-                        'total_accumulated': len([t for t in task.accumulated_tokens if t is not None])
+                        'cache_version': task.cache_version,
+                        'discarded_proactive_tokens': len(tokens),
                     }
+                task.reused_proactive_tokens += len(tokens)
+                task.add_batch(tokens, probs, index)
+            else:
+                status = task.proactive_parent_status(parent_round_id, expected_prefix_token)
+                if status in {'not_started', 'pending'} and not should_verify:
+                    return {
+                        'status': 'buffered_pending_nav',
+                        'parent_status': status,
+                        'n_past': task.n_past,
+                        'parent_round_id': parent_round_id,
+                        'total_buffered': len([
+                            token for token in task.proactive_buffers[parent_round_id]['tokens']
+                            if token is not None
+                        ]),
+                        'add_result': add_result,
+                    }
+                # A waiting-NAV request may reach the cloud before its parent
+                # NAV.  Wait for the parent to arrive and finish, releasing the
+                # condition so the parent request can make progress.
+                while status in {'not_started', 'pending'}:
+                    task.verify_condition.wait()
+                    status = task.proactive_parent_status(parent_round_id, expected_prefix_token)
+                if status != 'valid':
+                    discarded = task.discard_proactive_buffer(parent_round_id)
+                    return {
+                        'status': 'discarded_stale_proactive_batch',
+                        'reason': 'parent_nav_invalid',
+                        'parent_round_id': parent_round_id,
+                        'speculative_round_id': round_id,
+                        'n_past': task.n_past,
+                        'cache_version': task.cache_version,
+                        'discarded_proactive_tokens': discarded,
+                    }
+                # The completing NAV normally promotes batches that arrived while
+                # it was running.  A batch arriving just after completion is
+                # promoted here instead.
+                if parent_round_id in task.proactive_buffers:
+                    task.promote_proactive_buffer(parent_round_id)
 
-            with model_lock:
-                task.restore_model_state()
-                result = task.verify_tokens(n_past_at_receive)
-                task.save_model_state()
-                task.veridy_num += 1
-            return result
+            if not should_verify:
+                return {
+                    'status': 'accumulated',
+                    'n_past': task.n_past,
+                    'total_accumulated': len([
+                        token for token in task.accumulated_tokens if token is not None
+                    ]),
+                    'add_result': add_result,
+                }
 
-        add_result = task.add_batch(tokens, probs, index)
-        return {
-            'status': 'accumulated',
-            'n_past': task.n_past,
-            'total_accumulated': len([t for t in task.accumulated_tokens if t is not None]),
-            'add_result': add_result
-        }
+    with task.verify_condition:
+        index = payload.get(
+            'index', len([t for t in task.accumulated_tokens if t is not None])
+        )
+        if not is_proactive:
+            task.add_batch(tokens, probs, index)
+        if not should_verify:
+            return {
+                'status': 'accumulated',
+                'n_past': task.n_past,
+                'total_accumulated': len([
+                    token for token in task.accumulated_tokens if token is not None
+                ]),
+                'add_result': True,
+            }
+
+        while task.verify_in_progress:
+            task.verify_condition.wait()
+        task.verify_in_progress = True
+        task.active_verify_round_id = int(round_id) if round_id is not None else task.cache_version
+        active_round_id = task.active_verify_round_id
+        # Wake a proactive waiting-NAV request that arrived before its parent.
+        # It will observe ``pending`` and continue waiting for completion.
+        task.verify_condition.notify_all()
+
+    # Do not hold task.lock here: proactive HTTP requests must remain able to
+    # populate task.proactive_buffers while target-model verification runs.
+    try:
+        with model_lock:
+            task.restore_model_state()
+            result = task.verify_tokens(n_past_at_receive)
+            task.save_model_state()
+            task.veridy_num += 1
+    finally:
+        with task.verify_condition:
+            if 'result' in locals():
+                task.completed_verifications[active_round_id] = dict(result)
+                task.last_completed_round_id = active_round_id
+                task.last_verify_pass = (
+                    result.get('n_accepted') == result.get('n_speculative')
+                )
+                task.final_token = result.get('final_token')
+                proactive_entry = task.proactive_buffers.get(active_round_id)
+                if proactive_entry is not None:
+                    status = task.proactive_parent_status(
+                        active_round_id, proactive_entry.get('expected_prefix_token')
+                    )
+                    # Temporarily clear the in-progress flag so status consults
+                    # the completed result just recorded above.
+                    if status == 'pending':
+                        all_accepted = result.get('n_accepted') == result.get('n_speculative')
+                        prefix_matches = (
+                            proactive_entry.get('expected_prefix_token') is not None
+                            and result.get('final_token') is not None
+                            and int(proactive_entry['expected_prefix_token']) == int(result['final_token'])
+                        )
+                        status = 'valid' if all_accepted and prefix_matches else 'invalid'
+                    if status == 'valid':
+                        task.promote_proactive_buffer(active_round_id)
+                    else:
+                        task.discard_proactive_buffer(active_round_id)
+            task.verify_in_progress = False
+            task.active_verify_round_id = None
+            task.verify_condition.notify_all()
+    return result
 
 
 def handle_exit_payload(payload):
@@ -443,9 +702,13 @@ def handle_exit_payload(payload):
         with active_tasks_lock:
             task = active_tasks.pop(task_id, None) if task_id is not None else None
         if task is not None:
+            task.stop_energy_tracking()
             power_int = task.total_gpu_power_integral_joules
             response['gpu_power_integral_joules'] = power_int
             response['verify_num'] = task.veridy_num
+            response['cache_version'] = task.cache_version
+            response['discarded_proactive_tokens'] = task.discarded_proactive_tokens
+            response['reused_proactive_tokens'] = task.reused_proactive_tokens
             logger.info("task=%s gpu_power_integral_total=%.6fJ (final)", task_id, power_int)
 
     return response
@@ -455,6 +718,13 @@ async def init(request: InitRequest):  # 直接使用 Pydantic 模型
     from anyio.to_thread import run_sync
 
     return await run_sync(handle_init_request, request)
+
+
+@app.post("/start")
+async def start(request: TaskRequest):
+    from anyio.to_thread import run_sync
+
+    return await run_sync(handle_start_request, request)
 
 @app.post("/delay")
 async def delay(request: Request):

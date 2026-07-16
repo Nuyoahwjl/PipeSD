@@ -21,7 +21,7 @@ Detailed repository walkthrough: `docs/repo-summary.md`
 - `figs/`: exp results figures
 
 ## Configuration
-- Cloud URL is hard-coded in `src/engine.py` (`URL = ...`). Update it to point at your running cloud service.
+- Set `PIPE_SD_SERVER_URL` to the cloud service URL (for example `http://127.0.0.1:8000`).
 - CLI flags are defined in `src/util.py` (e.g. `--dataset`, `--algorithm`, thresholds, bandwidth settings).
 
 ## Running an evaluation
@@ -36,6 +36,12 @@ Common arguments (see `src/util.py` for the full list):
 - `--verify_strategy`: `fixed-num`, `single-token`, `multiple-tokens`, `hybrid`
 - `--bandwidth_MBps`: network bandwidth limit used by the sender
 
+Upload behavior is algorithm-specific: Vanilla/HSL upload the complete draft
+once at NAV; EdgeLLM uploads proactively only while NAV is pending, in the
+current moving-average `N-hat` window; PipeSD applies its DP batch schedule both
+before NAV and while NAV is pending. Bayesian threshold optimization is a
+PipeSD-only entrypoint.
+
 ## Sweep scripts
 In `edge/scripts/`:
 - `sweep.sh`, `sweep_gsm8k.sh`: run multi-config sweeps
@@ -49,3 +55,7 @@ bash scripts/sweep.sh
 
 ## Outputs
 Results are written under `edge/exp/` as JSON (one entry per run).
+
+For the paper-aligned 1000-token Table 1 protocol, BO procedure, four-method
+commands, metrics, and correctness evaluation, see
+[`docs/table1-paper-protocol.md`](docs/table1-paper-protocol.md).

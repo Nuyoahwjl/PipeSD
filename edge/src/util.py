@@ -31,7 +31,7 @@ def model_zoo(args):
         "deepseek-coder-1.3b-instruct-GGUF": "pre_models/deepseek-coder-1.3b-instruct-GGUF/deepseek-coder-1.3b-instruct.Q4_K_M.gguf",
     }
 
-    # args.vocab_size = vocab_size[args.draft_model]
+    args.vocab_size = vocab_size[args.draft_model]
     args.draft_model = zoo[args.draft_model]
     # args.target_model = zoo[args.target_model]
 
@@ -56,7 +56,7 @@ def parse_arguments():
     parser.add_argument('--C', type=float, default=0.025, help='startup cost')
     parser.add_argument('--verify_strategy', type=str, default="fixed-num", choices=["fixed-num", "single-token", "multiple-tokens", "hybrid"], help='verification strategy.')
     parser.add_argument('--verify_num', type=int, default=8, help='number of tokens to verify in fixed-num strategy.')
-    parser.add_argument('--bayes_optimize', action='store_true', help='Enable Bayesian optimization over hybrid thresholds.')
+    parser.add_argument('--bayes_optimize', action='store_true', help='Enable PipeSD Bayesian optimization over hybrid thresholds.')
     parser.add_argument('--bayes_only', action='store_true', help='Run BO and exit without formal evaluation.')
     parser.add_argument('--bayes_calls', type=int, default=16, help='Total BO samples (16 in the paper).')
     parser.add_argument('--bayes_init_points', type=int, default=1, help='Random initial samples (one in the paper).')
@@ -64,21 +64,41 @@ def parse_arguments():
     parser.add_argument('--bayes_single_max', type=float, default=1.0, help='Upper bound for R2 search.')
     parser.add_argument('--bayes_multi_min', type=float, default=1e-6, help='Lower bound for R1 search.')
     parser.add_argument('--bayes_multi_max', type=float, default=1.0, help='Upper bound for R1 search.')
-    parser.add_argument('--bayes_tokens_per_sample', type=int, default=None, help='Accepted tokens measured for each selected dataset sample in every BO candidate.')
-    parser.add_argument('--bayes_tokens_per_trial', type=int, default=None, help='Deprecated alias for --bayes_tokens_per_sample.')
+    parser.add_argument(
+        '--bo_protocol',
+        choices=['paper', 'sample_coverage'],
+        default='paper',
+        help='paper: 20 accepted tokens total per candidate; sample_coverage: a per-sample budget.',
+    )
+    parser.add_argument('--bayes_tokens_per_sample', type=int, default=None, help='Accepted tokens per selected sample in sample_coverage BO mode.')
+    parser.add_argument('--bayes_tokens_per_trial', type=int, default=20, help='Accepted tokens total per candidate in paper BO mode.')
     parser.add_argument('--bayes_ei_xi', type=float, default=0.1, help='Expected-improvement exploration parameter.')
-    parser.add_argument('--init_alpha', type=float, default=0.92, help='Initial alpha value for some parameter.')
+    parser.add_argument('--init_alpha', type=float, default=0.92, help='Initial EdgeLLM cumulative-confidence threshold R1.')
     parser.add_argument('--multiply_times', type=float, default=0.95, help='Decay rate for alpha parameter.')
+    parser.add_argument('--edge_llm_full_accept_decay', type=float, default=0.5, help='Paper Eq. (7) decay applied after a fully accepted EdgeLLM round.')
     parser.add_argument('--init_rtt', type=float, default=0.05, help='Initial RTT estimate in seconds used by the bandwidth limiter.')
-    parser.add_argument('--bandwidth_MBps', type=float, default=2.5, help='bandwidth limit in MB/s.')
+    parser.add_argument('--bandwidth_MBps', '--uplink_bandwidth_MBps', dest='bandwidth_MBps', type=float, default=2.5, help='Edge-to-cloud uplink limit in MB/s (2.5 MB/s in Scenario 1).')
+    parser.add_argument('--downlink_bandwidth_MBps', type=float, default=25.0, help='Cloud-to-edge downlink limit recorded in the manifest; enforce it at the cloud/OS (25 MB/s in Scenario 1).')
+    parser.add_argument(
+        '--network_shaping_mode',
+        choices=['software', 'os'],
+        default='software',
+        help='software uses the legacy post-request timing quota; os relies on tc/QoS and measures real transport time.',
+    )
     parser.add_argument('--server_timeout_s', type=int, default=10, help='HTTP timeout in seconds for cloud requests.')
     parser.add_argument('--baseline_test', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
     parser.add_argument('--edgeLLM', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')
-    parser.add_argument('--default_token_compute', type=float, default=0.036, help='Default single-token compute time used for planning.')
+    parser.add_argument('--initial_generation_gamma', type=float, default=0.036, help='Initial per-token generation estimate used only by the DP planner.')
+    parser.add_argument('--default_token_compute', type=float, default=None, help='Deprecated alias for --initial_generation_gamma; it no longer enables artificial delay.')
+    parser.add_argument('--enable_compute_emulation', action='store_true', help='Enable artificial per-token delay for emulated Scenario 2/3 only.')
+    parser.add_argument('--emulated_generation_delay', type=float, default=0.0, help='Extra seconds slept after each generated token when compute emulation is enabled.')
     parser.add_argument('--token_size_MB', type=float, default=0.29, help='Average token size in MB used for planning.')
     parser.add_argument('--schedule_window', type=int, default=20, help='Initial DP scheduling window N-hat.')
     parser.add_argument('--schedule_history_size', type=int, default=100, help='Draft sequences used for moving-average N-hat.')
-    parser.add_argument('--environment_update_threshold', type=float, default=0.2, help='Relative change needed to update DP/BO.')
+    parser.add_argument('--environment_update_threshold', type=float, default=None, help='Deprecated shared threshold for all online updates.')
+    parser.add_argument('--tpt_update_threshold', type=float, default=0.2, help='TPT relative-change threshold delta1.')
+    parser.add_argument('--gamma_update_threshold', type=float, default=0.2, help='Generation-time relative-change threshold delta2.')
+    parser.add_argument('--communication_update_threshold', type=float, default=0.2, help='Communication alpha/beta relative-change threshold delta3.')
     parser.add_argument('--regression_min_comm_samples', type=int, default=8, help='Minimum communication samples before alpha/beta regression.')
     parser.add_argument(
         '--disable_online_environment_measurement',
@@ -93,6 +113,14 @@ def parse_arguments():
         help='Merge scheduling policy used by pipesd during speculative upload.',
     )
     parser.add_argument('--result_tag', type=str, default="", help='Optional tag appended to result filenames to isolate experiment runs.')
+    parser.add_argument(
+        '--evaluation_protocol',
+        choices=['sample_index', 'paper_table1'],
+        default='sample_index',
+        help='sample_index preserves the legacy index-based debug run; paper_table1 stops at a shared accepted-token budget.',
+    )
+    parser.add_argument('--target_output_tokens', type=int, default=1000, help='Accepted-token budget for paper_table1.')
+    parser.add_argument('--run_id', type=str, default='', help='Stable run identifier; generated automatically when omitted.')
     parser.add_argument('--task_id_offset', type=int, default=0, help='Offset added to each task id to avoid collisions across concurrent clients.')
     parser.add_argument(
         '--use_env_proxy',
@@ -116,6 +144,12 @@ def args_proc(args):
     """Process args after parsing."""
 
     args.data_path = f"data/{args.dataset}.jsonl"
+    if getattr(args, 'default_token_compute', None) is not None:
+        args.initial_generation_gamma = args.default_token_compute
+    if getattr(args, 'environment_update_threshold', None) is not None:
+        args.tpt_update_threshold = args.environment_update_threshold
+        args.gamma_update_threshold = args.environment_update_threshold
+        args.communication_update_threshold = args.environment_update_threshold
 
     # Process dataset-specific default models
     if args.dataset == "humaneval":

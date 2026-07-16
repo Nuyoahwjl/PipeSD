@@ -97,6 +97,10 @@ class FakeLlama:
 
 
 def install_stub_modules():
+    msgpack = types.ModuleType("msgpack")
+    msgpack.unpackb = lambda payload, raw=False: payload
+    sys.modules["msgpack"] = msgpack
+
     fastapi = types.ModuleType("fastapi")
     fastapi.FastAPI = FakeFastAPI
     fastapi.HTTPException = FakeHTTPException
@@ -297,6 +301,198 @@ class CloudServerTaskStateTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
         self.assertGreater(elapsed, 0.35)
+
+    def test_stale_proactive_batch_is_discarded_before_buffering(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task.last_verify_pass = False
+        task.final_token = 4
+        module.active_tasks[1] = task
+
+        result = module.handle_propose_payload({
+            "type": "propose_waiting",
+            "task_id": 1,
+            "tokens": [5, 6],
+            "probs": [[1.0] * 8, [1.0] * 8],
+            "index": 0,
+            "should_verify": False,
+            "expected_prefix_token": 4,
+        })
+
+        self.assertEqual(result["status"], "discarded_stale_proactive_batch")
+        self.assertEqual(task.accumulated_tokens, [])
+        self.assertEqual(task.discarded_proactive_tokens, 2)
+
+    def test_matching_proactive_batch_is_buffered(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task.last_verify_pass = True
+        task.final_token = 4
+        module.active_tasks[1] = task
+
+        result = module.handle_propose_payload({
+            "type": "propose_waiting",
+            "task_id": 1,
+            "tokens": [5, 6],
+            "probs": [[1.0] * 8, [1.0] * 8],
+            "index": 0,
+            "should_verify": False,
+            "expected_prefix_token": 4,
+        })
+
+        self.assertEqual(result["status"], "accumulated")
+        self.assertEqual(task.accumulated_tokens, [5, 6])
+        self.assertEqual(task.reused_proactive_tokens, 2)
+
+    def test_proactive_batch_arrives_while_parent_nav_is_running(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        module.active_tasks[1] = task
+        verify_started = threading.Event()
+        allow_verify_to_finish = threading.Event()
+
+        task.restore_model_state = lambda: None
+        task.save_model_state = lambda: None
+
+        def slow_verify(n_past_at_verify):
+            verify_started.set()
+            self.assertTrue(allow_verify_to_finish.wait(timeout=2.0))
+            return {
+                "n_accepted": 1,
+                "n_speculative": 1,
+                "final_token": 4,
+                "n_past": n_past_at_verify + 2,
+            }
+
+        task.verify_tokens = slow_verify
+        nav_result = {}
+
+        def run_nav():
+            nav_result.update(module.handle_propose_payload({
+                "type": "propose",
+                "task_id": 1,
+                "tokens": [3],
+                "probs": [[1.0] * 8],
+                "index": 0,
+                "should_verify": True,
+                "n_past": 1,
+                "speculative_round_id": 0,
+            }))
+
+        nav_thread = threading.Thread(target=run_nav)
+        nav_thread.start()
+        self.assertTrue(verify_started.wait(timeout=1.0))
+
+        started = time.perf_counter()
+        proactive_result = module.handle_propose_payload({
+            "type": "propose_waiting",
+            "task_id": 1,
+            "tokens": [5],
+            "probs": [[1.0] * 8],
+            "index": 0,
+            "should_verify": False,
+            "n_past": 3,
+            "speculative_round_id": 1,
+            "parent_round_id": 0,
+            "prefix_version": 1,
+            "expected_prefix_token": 4,
+        })
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(proactive_result["status"], "buffered_pending_nav")
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(nav_thread.is_alive())
+
+        allow_verify_to_finish.set()
+        nav_thread.join(timeout=2.0)
+        self.assertFalse(nav_thread.is_alive())
+        self.assertEqual(nav_result["final_token"], 4)
+        self.assertEqual(task.accumulated_tokens, [5])
+        self.assertEqual(task.reused_proactive_tokens, 1)
+
+    def test_waiting_nav_may_arrive_before_parent_nav_starts(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        module.active_tasks[1] = task
+        task.restore_model_state = lambda: None
+        task.save_model_state = lambda: None
+        verify_calls = []
+
+        def verify(n_past_at_verify):
+            speculative_count = len([
+                token for token in task.accumulated_tokens if token is not None
+            ])
+            verify_calls.append(speculative_count)
+            task.reset_accumulated()
+            if len(verify_calls) == 1:
+                return {
+                    "n_accepted": 1,
+                    "n_speculative": 1,
+                    "final_token": 4,
+                    "n_past": n_past_at_verify + 2,
+                }
+            return {
+                "n_accepted": 1,
+                "n_speculative": 1,
+                "final_token": 6,
+                "n_past": n_past_at_verify + 2,
+            }
+
+        task.verify_tokens = verify
+        waiting_result = {}
+
+        def run_waiting_nav():
+            waiting_result.update(module.handle_propose_payload({
+                "type": "propose_waiting",
+                "task_id": 1,
+                "tokens": [5],
+                "probs": [[1.0] * 8],
+                "index": 0,
+                "should_verify": True,
+                "n_past": 3,
+                "speculative_round_id": 1,
+                "parent_round_id": 0,
+                "prefix_version": 1,
+                "expected_prefix_token": 4,
+            }))
+
+        waiting_thread = threading.Thread(target=run_waiting_nav)
+        waiting_thread.start()
+
+        deadline = time.time() + 1.0
+        while 0 not in task.proactive_buffers and time.time() < deadline:
+            time.sleep(0.005)
+        self.assertIn(0, task.proactive_buffers)
+        self.assertTrue(waiting_thread.is_alive())
+
+        parent_result = module.handle_propose_payload({
+            "type": "propose",
+            "task_id": 1,
+            "tokens": [3],
+            "probs": [[1.0] * 8],
+            "index": 0,
+            "should_verify": True,
+            "n_past": 1,
+            "speculative_round_id": 0,
+        })
+
+        waiting_thread.join(timeout=2.0)
+        self.assertFalse(waiting_thread.is_alive())
+        self.assertEqual(parent_result["n_accepted"], 1)
+        self.assertEqual(waiting_result["n_accepted"], 1)
+        self.assertNotEqual(
+            waiting_result.get("status"), "discarded_stale_proactive_batch"
+        )
+        self.assertEqual(verify_calls, [1, 1])
+        self.assertEqual(task.reused_proactive_tokens, 1)
 
 
 if __name__ == "__main__":
