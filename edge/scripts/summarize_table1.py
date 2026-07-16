@@ -51,6 +51,12 @@ def main():
     parser.add_argument("root", type=Path, help="Result directory, normally edge/exp/exp__wjl")
     parser.add_argument("--output", type=Path, default=Path("table1_summary.json"))
     parser.add_argument("--humaneval-jsonl", type=Path, default=Path("humaneval_completions.jsonl"))
+    parser.add_argument(
+        "--network-implementation",
+        choices=("current_software", "os", "any"),
+        default="current_software",
+        help="Filter incompatible network implementations; defaults to shared-fifo-v1 software results.",
+    )
     args = parser.parse_args()
 
     grouped = defaultdict(list)
@@ -67,6 +73,14 @@ def main():
         manifest = payload.get("manifest", {})
         summary = payload.get("summary", {})
         if summary.get("evaluation_protocol") != "paper_table1":
+            continue
+        shaping_mode = manifest.get("network_shaping_mode")
+        emulator_version = (manifest.get("network_emulation") or {}).get("emulator_version")
+        if args.network_implementation == "current_software" and not (
+            shaping_mode == "software" and emulator_version == "shared-fifo-v1"
+        ):
+            continue
+        if args.network_implementation == "os" and shaping_mode != "os":
             continue
         dataset = str(manifest.get("dataset", "")).lower()
         method = manifest.get("algorithm")
@@ -93,7 +107,11 @@ def main():
                     "run_id": manifest.get("run_id"),
                 })
 
-    report = {"paper_scenario1_tpt_ms": PAPER_SCENARIO1_TPT_MS, "results": {}}
+    report = {
+        "paper_scenario1_tpt_ms": PAPER_SCENARIO1_TPT_MS,
+        "network_implementation_filter": args.network_implementation,
+        "results": {},
+    }
     for dataset in PAPER_SCENARIO1_TPT_MS:
         report["results"][dataset] = {}
         pipesd_tpts = [

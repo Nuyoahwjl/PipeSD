@@ -14,6 +14,7 @@ from typing import List, Dict, Optional, Tuple
 import msgpack
 import threading
 from .comm import BandwidthSender
+from .software_link import SoftwareLink
 # For GGUF model support
 try:
     from llama_cpp import Llama
@@ -38,6 +39,24 @@ EXIT_ENDPOINT = f"{URL}/exit"
 DELAY_ENDPOINT = f"{URL}/delay"
 
 max_probs = []
+
+
+def _parse_bandwidth_profile(value: str) -> List[Tuple[float, float]]:
+    profile: List[Tuple[float, float]] = []
+    for raw_pair in str(value or "").split(","):
+        raw_pair = raw_pair.strip()
+        if not raw_pair:
+            continue
+        try:
+            uplink, downlink = (float(item.strip()) for item in raw_pair.split(":", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "software_bandwidth_profile must use up_MBps:down_MBps pairs"
+            ) from exc
+        if uplink <= 0 or downlink <= 0:
+            raise ValueError("software bandwidth profile rates must be positive")
+        profile.append((uplink, downlink))
+    return profile
 
 def _json_safe(value):
     if isinstance(value, dict):
@@ -68,7 +87,23 @@ class Decoding(ABC):
         self.verify_strategy: str = getattr(args, 'verify_strategy', "fixed-num")
         self.verify_num: int = getattr(args, 'verify_num', 8)
         self.accumulated_probs: float = 0.0
-        self.bandwidth_MBps: float = getattr(args, 'bandwidth_MBps', 2) 
+        self.bandwidth_MBps: float = getattr(args, 'bandwidth_MBps', 2)
+        self.downlink_bandwidth_MBps: float = getattr(args, 'downlink_bandwidth_MBps', 25.0)
+        self.network_shaping_mode: str = getattr(args, 'network_shaping_mode', 'software')
+        configured_uplink_startup_ms = getattr(args, 'software_uplink_startup_ms', None)
+        self.software_uplink_startup_seconds = (
+            self.C if configured_uplink_startup_ms is None
+            else max(0.0, float(configured_uplink_startup_ms) / 1000.0)
+        )
+        self.software_downlink_startup_seconds = max(
+            0.0, float(getattr(args, 'software_downlink_startup_ms', 0.0)) / 1000.0
+        )
+        self.software_bandwidth_profile = _parse_bandwidth_profile(
+            getattr(args, 'software_bandwidth_profile', '')
+        )
+        # Start a dynamic trace only after model loading, so every method sees
+        # profile entry zero at the beginning of measured inference.
+        self._network_profile_started_at = None
         self.merge_policy: str = getattr(args, 'merge_policy', 'dp')
         self.verify_thresh_single = getattr(args, 'verify_thresh_single', 0.94)
         self.verify_thresh_multi = getattr(args, 'verify_thresh_multi', 0.9)
@@ -93,7 +128,7 @@ class Decoding(ABC):
             min_comm_samples=getattr(self.args, "regression_min_comm_samples", 8),
         )
         self.dp_scheduler = PaperDPScheduler(
-            alpha=self.C,
+            alpha=self.software_uplink_startup_seconds + self.software_downlink_startup_seconds,
             beta=(self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
             gamma=getattr(self.args, "initial_generation_gamma", None)
             or getattr(self.args, "default_token_compute", None)
@@ -146,15 +181,35 @@ class Decoding(ABC):
             self.process_model_ready_at = end_time
         self.color_print(f"[Edge] 模型加载完成，耗时: {end_time - start_time:.2f} 秒", 5)
 
+        software_mode = self.network_shaping_mode == "software"
+        if software_mode and self._network_profile_started_at is None:
+            self._network_profile_started_at = time.monotonic()
+        self.software_link = (
+            SoftwareLink(
+                uplink_MBps=self.bandwidth_MBps,
+                downlink_MBps=self.downlink_bandwidth_MBps,
+                uplink_startup_seconds=self.software_uplink_startup_seconds,
+                downlink_startup_seconds=self.software_downlink_startup_seconds,
+                bandwidth_profile=self.software_bandwidth_profile,
+                profile_interval_seconds=getattr(
+                    self.args, "software_bandwidth_change_interval_s", 20.0
+                ),
+                profile_started_at=self._network_profile_started_at,
+                history_size=getattr(self.args, "schedule_history_size", 100),
+            )
+            if software_mode else None
+        )
         sender_kwargs = {
             "bandwidth_MBps": self.bandwidth_MBps,
-            "base_latency": self.C,
+            "base_latency": self.software_uplink_startup_seconds,
             "timeout": getattr(self.args, "server_timeout_s", 10),
             "use_env_proxy": getattr(self.args, "use_env_proxy", False),
-            "software_bandwidth_emulation": (
-                getattr(self.args, "network_shaping_mode", "software") == "software"
-            ),
+            "software_bandwidth_emulation": software_mode,
             "on_complete": self._on_send_measurement if self.online_environment_measurement else None,
+            "link": self.software_link,
+            "downlink_bandwidth_MBps": self.downlink_bandwidth_MBps,
+            "downlink_base_latency": self.software_downlink_startup_seconds,
+            "measurement_history_size": getattr(self.args, "schedule_history_size", 100),
         }
         # Pre-NAV traffic remains ordered on the primary channel. A second
         # channel can upload next-round batches while NAV is still running.
@@ -264,7 +319,26 @@ class Decoding(ABC):
                 "online_measurement_enabled": self.online_environment_measurement,
                 "estimator": self.environment_estimator.snapshot(),
                 "dp_scheduler": self.dp_scheduler.snapshot(),
+                "software_link": self.software_link.snapshot() if self.software_link else None,
+                "primary_sender": self.sender.snapshot() if hasattr(self, "sender") else None,
+                "proactive_sender": self.proactive_sender.snapshot() if hasattr(self, "proactive_sender") else None,
             }
+
+    def _network_configuration_snapshot(self) -> Dict[str, object]:
+        return {
+            "mode": self.network_shaping_mode,
+            "emulator_version": SoftwareLink.VERSION if self.network_shaping_mode == "software" else None,
+            "queue_policy": "shared-fifo-per-direction" if self.network_shaping_mode == "software" else "os-managed",
+            "uplink_bandwidth_MBps": self.bandwidth_MBps,
+            "downlink_bandwidth_MBps": self.downlink_bandwidth_MBps,
+            "uplink_startup_seconds": self.software_uplink_startup_seconds if self.network_shaping_mode == "software" else None,
+            "downlink_startup_seconds": self.software_downlink_startup_seconds if self.network_shaping_mode == "software" else None,
+            "bandwidth_profile": [list(item) for item in self.software_bandwidth_profile],
+            "bandwidth_change_interval_seconds": (
+                float(getattr(self.args, "software_bandwidth_change_interval_s", 20.0))
+                if self.software_bandwidth_profile else None
+            ),
+        }
 
     def _record_token_time(self, token_count: int) -> None:
         if token_count <= 0:

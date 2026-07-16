@@ -2,11 +2,26 @@
 import threading
 import queue
 import time
+import json
 import requests
 import concurrent.futures
 import collections
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
+
+from .software_link import SoftwareLink
+
+
+def _serialize_payload(payload: Any, headers: Dict[str, str]):
+    """Serialize once so byte accounting matches the body sent on the wire."""
+    normalized_headers = dict(headers or {})
+    if isinstance(payload, bytes):
+        return payload, normalized_headers
+    if isinstance(payload, bytearray):
+        return bytes(payload), normalized_headers
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    normalized_headers.setdefault("Content-Type", "application/json")
+    return body, normalized_headers
 
 
 @dataclass
@@ -23,13 +38,7 @@ class PendingRequest:
 
     @property
     def payload_size(self) -> int:
-        payload = self.payload
-        if isinstance(payload, (bytes, bytearray)):
-            return len(payload)
-        try:
-            return len(payload)
-        except Exception:
-            return 0
+        return len(_serialize_payload(self.payload, self.headers)[0])
 
 class BandwidthSender:
     def __init__(
@@ -40,6 +49,10 @@ class BandwidthSender:
         use_env_proxy: bool = False,
         software_bandwidth_emulation: bool = True,
         on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+        link: Optional[SoftwareLink] = None,
+        downlink_bandwidth_MBps: float = 25.0,
+        downlink_base_latency: float = 0.0,
+        measurement_history_size: int = 100,
     ):
         self._q = queue.Queue()
         self._bandwidth_bytes = bandwidth_MBps * 1_000_000
@@ -48,16 +61,34 @@ class BandwidthSender:
         self._use_env_proxy = use_env_proxy
         self._software_bandwidth_emulation = bool(software_bandwidth_emulation)
         self._on_complete = on_complete
+        self._link = link
+        if self._software_bandwidth_emulation and self._link is None:
+            self._link = SoftwareLink(
+                uplink_MBps=bandwidth_MBps,
+                downlink_MBps=downlink_bandwidth_MBps,
+                uplink_startup_seconds=base_latency,
+                downlink_startup_seconds=downlink_base_latency,
+            )
         self._lock = threading.Lock()
         self._pending_requests = collections.defaultdict(collections.deque)
         self._tag_futures = collections.defaultdict(list)
         self._future_to_request = {}
+        self._measurements = collections.deque(maxlen=max(1, int(measurement_history_size)))
+        self._measurement_totals = {
+            "requests": 0,
+            "successful_requests": 0,
+            "payload_bytes": 0,
+            "response_bytes": 0,
+            "total_elapsed_seconds": 0.0,
+        }
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def set_bandwidth(self, bandwidth_MBps: float) -> None:
+    def set_bandwidth(self, bandwidth_MBps: float, downlink_bandwidth_MBps: Optional[float] = None) -> None:
         with self._lock:
             self._bandwidth_bytes = bandwidth_MBps * 1_000_000
+        if self._link is not None:
+            self._link.set_bandwidths(bandwidth_MBps, downlink_bandwidth_MBps)
 
     def submit(
         self,
@@ -175,6 +206,13 @@ class BandwidthSender:
         self._q.put(None)
         self._thread.join()
 
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "totals": dict(self._measurement_totals),
+                "recent_requests": list(self._measurements),
+            }
+
     def _release_pending(self, request: PendingRequest):
         tag = request.tag
         with self._lock:
@@ -197,21 +235,27 @@ class BandwidthSender:
                         self._tag_futures.pop(tag, None)
             self._future_to_request.pop(request.future, None)
 
-    def _notify_complete(self, request: PendingRequest, started_at: float, finished_at: float, success: bool):
+    def _notify_complete(self, measurement: Dict[str, Any]):
+        with self._lock:
+            self._measurements.append(dict(measurement))
+            self._measurement_totals["requests"] += 1
+            self._measurement_totals["successful_requests"] += int(bool(measurement.get("success")))
+            self._measurement_totals["payload_bytes"] += int(measurement.get("payload_size") or 0)
+            self._measurement_totals["response_bytes"] += int(measurement.get("response_size") or 0)
+            self._measurement_totals["total_elapsed_seconds"] += float(
+                measurement.get("total_elapsed_seconds") or 0.0
+            )
         if self._on_complete is None:
             return
         try:
-            self._on_complete({
-                "tag": request.tag,
-                "url": request.url,
-                "payload_size": request.payload_size,
-                "token_count": request.token_count,
-                "measurement_kind": request.measurement_kind,
-                "elapsed_seconds": max(0.0, finished_at - started_at),
-                "success": success,
-            })
+            self._on_complete(dict(measurement))
         except Exception:
             pass
+
+    @staticmethod
+    def _response_size(response: Any) -> int:
+        content = getattr(response, "content", b"") if response is not None else b""
+        return len(content) if isinstance(content, (bytes, bytearray)) else 0
 
     def _worker(self):
         session = requests.Session()
@@ -231,44 +275,34 @@ class BandwidthSender:
                     self._release_pending(request)
                     continue
 
-                if self._software_bandwidth_emulation and self._bandwidth_bytes > 0:
-                    quota = (request.payload_size / self._bandwidth_bytes) + self._base_latency
-                elif self._software_bandwidth_emulation:
-                    quota = self._base_latency
-                else:
-                    quota = 0.0
-                with self._lock:
-                    now = time.monotonic()
-
+                body, headers = _serialize_payload(request.payload, request.headers)
                 started_at = time.monotonic()
+                upload = None
+                download = None
+                resp = None
+                http_seconds = 0.0
                 success = False
-                completion_notified = False
                 try:
-                    if isinstance(request.payload, (bytes, bytearray)):
-                        resp = session.post(
-                            request.url,
-                            data=request.payload,
-                            headers=request.headers,
-                            timeout=self._timeout,
-                        )
-                    else:
-                        resp = session.post(
-                            request.url,
-                            json=request.payload,
-                            headers=request.headers,
-                            timeout=self._timeout,
-                        )
+                    # The cloud must not observe a request before its modeled
+                    # upload has completed. All sender instances share _link.
+                    if self._software_bandwidth_emulation and self._link is not None:
+                        upload = self._link.transmit("uplink", len(body))
+                    http_started_at = time.monotonic()
+                    resp = session.post(
+                        request.url,
+                        data=body,
+                        headers=headers,
+                        timeout=self._timeout,
+                    )
+                    http_seconds = max(0.0, time.monotonic() - http_started_at)
+                    if self._software_bandwidth_emulation and self._link is not None:
+                        download = self._link.transmit("downlink", self._response_size(resp))
                     if resp.status_code == 502:
                         if not request.future.cancelled():
                             request.future.set_result({"error": 502})
                         continue
                     resp.raise_for_status()
-                    after = time.monotonic()
-                    if after - now < quota:
-                        time.sleep(quota - (after - now))
                     success = True
-                    self._notify_complete(request, started_at, time.monotonic(), success)
-                    completion_notified = True
                     if not request.future.cancelled():
                         request.future.set_result(
                             resp.json()
@@ -279,8 +313,31 @@ class BandwidthSender:
                     if not request.future.cancelled():
                         request.future.set_exception(exc)
                 finally:
-                    if not completion_notified:
-                        self._notify_complete(request, started_at, time.monotonic(), success)
+                    total_elapsed = max(0.0, time.monotonic() - started_at)
+                    upload_seconds = float((upload or {}).get("service_seconds", 0.0))
+                    download_seconds = float((download or {}).get("service_seconds", 0.0))
+                    # Queueing is excluded from the regression sample because
+                    # the DP recurrence already represents serial-link waiting.
+                    communication_seconds = (
+                        upload_seconds + http_seconds + download_seconds
+                        if self._software_bandwidth_emulation
+                        else total_elapsed
+                    )
+                    self._notify_complete({
+                        "tag": request.tag,
+                        "url": request.url,
+                        "payload_size": len(body),
+                        "response_size": self._response_size(resp),
+                        "token_count": request.token_count,
+                        "measurement_kind": request.measurement_kind,
+                        "elapsed_seconds": communication_seconds,
+                        "total_elapsed_seconds": total_elapsed,
+                        "link_queue_wait_seconds": float((upload or {}).get("queue_wait_seconds", 0.0)),
+                        "upload_seconds": upload_seconds,
+                        "http_seconds": http_seconds,
+                        "download_seconds": download_seconds,
+                        "success": success,
+                    })
                     self._release_pending(request)
         finally:
             session.close()

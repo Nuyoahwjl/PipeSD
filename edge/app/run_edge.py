@@ -167,6 +167,7 @@ class CloudEdgeSpeculativeEval(Decoding):
             "run_id": self.args.run_id,
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "bo_protocol": getattr(self.args, "bo_protocol", "paper"),
+            "network_emulation": self._network_configuration_snapshot(),
             **record,
         }
         with path.open("w", encoding="utf-8") as handle:
@@ -381,6 +382,9 @@ class CloudEdgeSpeculativeEval(Decoding):
             "uplink_bandwidth_MBps": self.bandwidth_MBps,
             "downlink_bandwidth_MBps": getattr(self.args, "downlink_bandwidth_MBps", None),
             "network_shaping_mode": getattr(self.args, "network_shaping_mode", "software"),
+            "network_emulation": self._network_configuration_snapshot(),
+            "bo_config_path": getattr(self.args, "bo_config_path", ""),
+            "bo_config_sha256": self._sha256_file(getattr(self.args, "bo_config_path", "")),
             "draft_model_path": self.args.draft_model,
             "draft_model_sha256": self._sha256_file(self.args.draft_model),
             "target_model_sha256": os.environ.get("PIPE_SD_TARGET_MODEL_SHA256"),

@@ -73,17 +73,42 @@ def parse_arguments():
     parser.add_argument('--bayes_tokens_per_sample', type=int, default=None, help='Accepted tokens per selected sample in sample_coverage BO mode.')
     parser.add_argument('--bayes_tokens_per_trial', type=int, default=20, help='Accepted tokens total per candidate in paper BO mode.')
     parser.add_argument('--bayes_ei_xi', type=float, default=0.1, help='Expected-improvement exploration parameter.')
+    parser.add_argument('--bo_config_path', type=str, default='', help='BO configuration used by a formal evaluation; recorded for provenance.')
     parser.add_argument('--init_alpha', type=float, default=0.92, help='Initial EdgeLLM cumulative-confidence threshold R1.')
     parser.add_argument('--multiply_times', type=float, default=0.95, help='Decay rate for alpha parameter.')
     parser.add_argument('--edge_llm_full_accept_decay', type=float, default=0.5, help='Paper Eq. (7) decay applied after a fully accepted EdgeLLM round.')
-    parser.add_argument('--init_rtt', type=float, default=0.05, help='Initial RTT estimate in seconds used by the bandwidth limiter.')
+    parser.add_argument('--init_rtt', type=float, default=0.05, help='Deprecated compatibility field; software timing uses the explicit startup parameters below.')
     parser.add_argument('--bandwidth_MBps', '--uplink_bandwidth_MBps', dest='bandwidth_MBps', type=float, default=2.5, help='Edge-to-cloud uplink limit in MB/s (2.5 MB/s in Scenario 1).')
-    parser.add_argument('--downlink_bandwidth_MBps', type=float, default=25.0, help='Cloud-to-edge downlink limit recorded in the manifest; enforce it at the cloud/OS (25 MB/s in Scenario 1).')
+    parser.add_argument('--downlink_bandwidth_MBps', type=float, default=25.0, help='Cloud-to-edge downlink limit in MB/s (25 MB/s in Scenario 1). Software mode enforces it in the shared link emulator.')
     parser.add_argument(
         '--network_shaping_mode',
         choices=['software', 'os'],
         default='software',
-        help='software uses the legacy post-request timing quota; os relies on tc/QoS and measures real transport time.',
+        help='software uses a shared pre-delivery uplink/downlink emulator; os relies on tc/QoS and measures real transport time.',
+    )
+    parser.add_argument(
+        '--software_uplink_startup_ms',
+        type=float,
+        default=None,
+        help='Fixed per-upload startup alpha in software mode. Defaults to --C converted to milliseconds.',
+    )
+    parser.add_argument(
+        '--software_downlink_startup_ms',
+        type=float,
+        default=0.0,
+        help='Fixed per-response startup in software mode. Keep 0 for the paper Scenario 1 unless calibrating a measured RTT.',
+    )
+    parser.add_argument(
+        '--software_bandwidth_profile',
+        type=str,
+        default='',
+        help='Optional repeating Scenario-4 profile as up_MBps:down_MBps pairs separated by commas.',
+    )
+    parser.add_argument(
+        '--software_bandwidth_change_interval_s',
+        type=float,
+        default=20.0,
+        help='Seconds between software bandwidth-profile entries (20 in paper Scenario 4).',
     )
     parser.add_argument('--server_timeout_s', type=int, default=10, help='HTTP timeout in seconds for cloud requests.')
     parser.add_argument('--baseline_test', action='store_true', help='Use full-merge baseline (send accumulated tokens only at verification).')

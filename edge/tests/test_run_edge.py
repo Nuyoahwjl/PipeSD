@@ -349,6 +349,41 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(decoder._spec_token_indices_sent, set())
         self.assertFalse(decoder.sender.kwargs["use_env_proxy"])
         self.assertIsNot(decoder.sender, decoder.proactive_sender)
+        self.assertIs(decoder.sender.kwargs["link"], decoder.proactive_sender.kwargs["link"])
+        self.assertIs(decoder.sender.kwargs["link"], decoder.software_link)
+        self.assertEqual(decoder.software_link.snapshot()["uplink_bandwidth_MBps"], 2.5)
+        self.assertEqual(decoder.software_link.snapshot()["downlink_bandwidth_MBps"], 25.0)
+
+    def test_software_network_configuration_records_startup_and_profile(self):
+        decoder = DummyDecoding(make_args(
+            C=0.025,
+            software_uplink_startup_ms=30.0,
+            software_downlink_startup_ms=5.0,
+            software_bandwidth_profile="1.25:18.75,10:35",
+            software_bandwidth_change_interval_s=20.0,
+        ))
+
+        snapshot = decoder._network_configuration_snapshot()
+
+        self.assertEqual(snapshot["mode"], "software")
+        self.assertEqual(snapshot["uplink_startup_seconds"], 0.03)
+        self.assertEqual(snapshot["downlink_startup_seconds"], 0.005)
+        self.assertEqual(snapshot["bandwidth_profile"], [[1.25, 18.75], [10.0, 35.0]])
+        self.assertEqual(snapshot["bandwidth_change_interval_seconds"], 20.0)
+
+    def test_latest_bayes_config_records_software_link_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decoder = DummyDecoding(make_args(run_id="bo-test"))
+            decoder.exp_name = tmpdir
+
+            path = CloudEdgeSpeculativeEval._write_latest_bayes_config(decoder, {
+                "best_thresh_single": 0.8,
+                "best_thresh_multi": 0.5,
+            })
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["network_emulation"]["emulator_version"], "shared-fifo-v1")
+        self.assertEqual(payload["network_emulation"]["queue_policy"], "shared-fifo-per-direction")
 
     def test_nav_measurement_is_excluded_from_communication_regression(self):
         decoder = DummyDecoding(make_args(algorithm="pipesd", verify_strategy="hybrid"))

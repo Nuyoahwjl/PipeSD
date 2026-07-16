@@ -7,17 +7,21 @@ cd "$EDGE_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-BO_TOKENS_PER_TRIAL="${BO_TOKENS_PER_TRIAL:-1000}"
+BO_TOKENS_PER_TRIAL="${BO_TOKENS_PER_TRIAL:-20}"
 
 cmd=( "$PYTHON_BIN" app/run_edge.py
   --dataset gsm8k
-  --seed "${SEED:-1234}"
+  --seed "${SEED:-3407}"
   --algorithm pipesd
   --verify_strategy hybrid
   --merge_policy "${PIPESD_MERGE_POLICY:-dp}"
   --bandwidth_MBps "${BANDWIDTH_MBPS:-2.5}"
   --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
   --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
+  --software_uplink_startup_ms "${SOFTWARE_UPLINK_STARTUP_MS:-25}"
+  --software_downlink_startup_ms "${SOFTWARE_DOWNLINK_STARTUP_MS:-0}"
+  --software_bandwidth_profile "${SOFTWARE_BANDWIDTH_PROFILE:-}"
+  --software_bandwidth_change_interval_s "${SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S:-20}"
   --start_index_of_sample "${START_INDEX:-0}"
   --end_index_of_sample "${END_INDEX:-1318}"
   --initial_generation_gamma "${INITIAL_GENERATION_GAMMA:-0.036}"
