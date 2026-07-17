@@ -59,3 +59,7 @@ Results are written under `edge/exp/` as JSON (one entry per run).
 For the paper-aligned 1000-token Table 1 protocol, BO procedure, four-method
 commands, metrics, and correctness evaluation, see
 [`docs/table1-paper-protocol.md`](docs/table1-paper-protocol.md).
+
+For the deployment comparison requested by the reproduction assignment—Pure
+Cloud, Pure Edge, serial Edge-Cloud SD (the existing Vanilla algorithm), and
+PipeSD—see [`docs/four-mode-evaluation.md`](docs/four-mode-evaluation.md).

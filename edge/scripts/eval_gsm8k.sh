@@ -24,7 +24,7 @@ EDGELLM_FULL_ACCEPT_DECAY="${EDGELLM_FULL_ACCEPT_DECAY:-0.5}"
 PIPESD_MERGE_POLICY="${PIPESD_MERGE_POLICY:-dp}"
 
 PIPESD_SINGLE_THRESH="${PIPESD_SINGLE_THRESH:-0.4}"
-PIPESD_MULTI_THRESH="${PIPESD_MULTI_THRESH:-0.8}"
+PIPESD_MULTI_THRESH="${PIPESD_MULTI_THRESH:-0.65}"
 PIPESD_BO_CONFIG="${PIPESD_BO_CONFIG:-}"
 
 INITIAL_GENERATION_GAMMA="${INITIAL_GENERATION_GAMMA:-0.036}"
@@ -65,81 +65,81 @@ run_cmd() {
   sleep 2
 }
 
-cmd=( "$PYTHON_BIN" app/run_edge.py
-  --dataset "$DATASET"
-  --seed "$SEED"
-  --algorithm vanilla
-  --verify_strategy fixed-num
-  --gamma "$VANILLA_GAMMA"
-  --verify_num "$VANILLA_VERIFY_NUM"
-  --bandwidth_MBps "$BANDWIDTH_MBPS"
-  --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
-  --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
-  --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
-  --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
-  --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
-  --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
-  --start_index_of_sample "$START_INDEX"
-  --end_index_of_sample "$END_INDEX"
-  --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
-  --evaluation_protocol "$EVALUATION_PROTOCOL"
-  --target_output_tokens "$TARGET_OUTPUT_TOKENS"
-  --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
-  --server_timeout_s "$SERVER_TIMEOUT_S"
-  --result_tag "$RESULT_TAG"
-)
-append_extra_args cmd
-run_cmd cmd
+# cmd=( "$PYTHON_BIN" app/run_edge.py
+#   --dataset "$DATASET"
+#   --seed "$SEED"
+#   --algorithm vanilla
+#   --verify_strategy fixed-num
+#   --gamma "$VANILLA_GAMMA"
+#   --verify_num "$VANILLA_VERIFY_NUM"
+#   --bandwidth_MBps "$BANDWIDTH_MBPS"
+#   --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
+#   --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
+#   --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
+#   --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
+#   --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
+#   --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
+#   --start_index_of_sample "$START_INDEX"
+#   --end_index_of_sample "$END_INDEX"
+#   --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
+#   --evaluation_protocol "$EVALUATION_PROTOCOL"
+#   --target_output_tokens "$TARGET_OUTPUT_TOKENS"
+#   --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
+#   --server_timeout_s "$SERVER_TIMEOUT_S"
+#   --result_tag "$RESULT_TAG"
+# )
+# append_extra_args cmd
+# run_cmd cmd
 
-cmd=( "$PYTHON_BIN" app/run_edge.py
-  --dataset "$DATASET"
-  --seed "$SEED"
-  --algorithm hsl
-  --verify_strategy single-token
-  --verify_thresh_single "$HSL_THRESH"
-  --bandwidth_MBps "$BANDWIDTH_MBPS"
-  --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
-  --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
-  --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
-  --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
-  --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
-  --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
-  --start_index_of_sample "$START_INDEX"
-  --end_index_of_sample "$END_INDEX"
-  --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
-  --evaluation_protocol "$EVALUATION_PROTOCOL"
-  --target_output_tokens "$TARGET_OUTPUT_TOKENS"
-  --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
-  --server_timeout_s "$SERVER_TIMEOUT_S"
-  --result_tag "$RESULT_TAG"
-)
-append_extra_args cmd
-run_cmd cmd
+# cmd=( "$PYTHON_BIN" app/run_edge.py
+#   --dataset "$DATASET"
+#   --seed "$SEED"
+#   --algorithm hsl
+#   --verify_strategy single-token
+#   --verify_thresh_single "$HSL_THRESH"
+#   --bandwidth_MBps "$BANDWIDTH_MBPS"
+#   --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
+#   --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
+#   --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
+#   --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
+#   --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
+#   --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
+#   --start_index_of_sample "$START_INDEX"
+#   --end_index_of_sample "$END_INDEX"
+#   --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
+#   --evaluation_protocol "$EVALUATION_PROTOCOL"
+#   --target_output_tokens "$TARGET_OUTPUT_TOKENS"
+#   --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
+#   --server_timeout_s "$SERVER_TIMEOUT_S"
+#   --result_tag "$RESULT_TAG"
+# )
+# append_extra_args cmd
+# run_cmd cmd
 
-cmd=( "$PYTHON_BIN" app/run_edge.py
-  --dataset "$DATASET"
-  --seed "$SEED"
-  --algorithm edgeLLM
-  --init_alpha "$EDGELLM_INIT_ALPHA"
-  --edge_llm_full_accept_decay "$EDGELLM_FULL_ACCEPT_DECAY"
-  --bandwidth_MBps "$BANDWIDTH_MBPS"
-  --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
-  --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
-  --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
-  --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
-  --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
-  --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
-  --start_index_of_sample "$START_INDEX"
-  --end_index_of_sample "$END_INDEX"
-  --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
-  --evaluation_protocol "$EVALUATION_PROTOCOL"
-  --target_output_tokens "$TARGET_OUTPUT_TOKENS"
-  --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
-  --server_timeout_s "$SERVER_TIMEOUT_S"
-  --result_tag "$RESULT_TAG"
-)
-append_extra_args cmd
-run_cmd cmd
+# cmd=( "$PYTHON_BIN" app/run_edge.py
+#   --dataset "$DATASET"
+#   --seed "$SEED"
+#   --algorithm edgeLLM
+#   --init_alpha "$EDGELLM_INIT_ALPHA"
+#   --edge_llm_full_accept_decay "$EDGELLM_FULL_ACCEPT_DECAY"
+#   --bandwidth_MBps "$BANDWIDTH_MBPS"
+#   --downlink_bandwidth_MBps "${DOWNLINK_BANDWIDTH_MBPS:-25}"
+#   --network_shaping_mode "${NETWORK_SHAPING_MODE:-software}"
+#   --software_uplink_startup_ms "$SOFTWARE_UPLINK_STARTUP_MS"
+#   --software_downlink_startup_ms "$SOFTWARE_DOWNLINK_STARTUP_MS"
+#   --software_bandwidth_profile "$SOFTWARE_BANDWIDTH_PROFILE"
+#   --software_bandwidth_change_interval_s "$SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S"
+#   --start_index_of_sample "$START_INDEX"
+#   --end_index_of_sample "$END_INDEX"
+#   --initial_generation_gamma "$INITIAL_GENERATION_GAMMA"
+#   --evaluation_protocol "$EVALUATION_PROTOCOL"
+#   --target_output_tokens "$TARGET_OUTPUT_TOKENS"
+#   --draft_n_gpu_layers "$DRAFT_N_GPU_LAYERS"
+#   --server_timeout_s "$SERVER_TIMEOUT_S"
+#   --result_tag "$RESULT_TAG"
+# )
+# append_extra_args cmd
+# run_cmd cmd
 
 cmd=( "$PYTHON_BIN" app/run_edge.py
   --dataset "$DATASET"

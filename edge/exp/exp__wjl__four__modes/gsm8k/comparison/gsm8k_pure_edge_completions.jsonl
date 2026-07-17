@@ -1,0 +1,63 @@
+{"task_id": 100, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 100}
+{"task_id": 101, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 101}
+{"task_id": 102, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 102}
+{"task_id": 103, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 103}
+{"task_id": 104, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 104}
+{"task_id": 105, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 105}
+{"task_id": 106, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 106}
+{"task_id": 107, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 107}
+{"task_id": 108, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 108}
+{"task_id": 109, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 109}
+{"task_id": 110, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 110}
+{"task_id": 111, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 111}
+{"task_id": 112, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 112}
+{"task_id": 113, "completion": "\n\nSolution:\n\n1. 2 flowers a day = 2 * 5 = 10\n2. 2 flowers a day * 15 days = 30\n3. 30 flowers = 2 * 10\n4. 2 flowers a day * 2 flowers a day * 10 flowers = 20\n5. 2 flowers a day * 2 flowers a day * 10 flowers = 20\n6. 2 flowers a day * 2 flowers a day * 10 flowers = 20\n7. ", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 113}
+{"task_id": 114, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 114}
+{"task_id": 115, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 115}
+{"task_id": 116, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 116}
+{"task_id": 117, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 117}
+{"task_id": 118, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 118}
+{"task_id": 119, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 119}
+{"task_id": 120, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 120}
+{"task_id": 121, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 121}
+{"task_id": 122, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 122}
+{"task_id": 123, "completion": "\n\nSolution:\n\nThe answer is: 10 x 3 = 30\n\nThe number of miles she can run in 7 hours is:\n\n30 / 7 = 4.5\n\nTherefore, she can run 4.5 miles per hour in 7 hours.", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 123}
+{"task_id": 124, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 124}
+{"task_id": 125, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 125}
+{"task_id": 126, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 126}
+{"task_id": 127, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 127}
+{"task_id": 128, "completion": "\n\nSolution:\n\nThe total amount of money he will spend is:\n\n- Watermelons: 3 x 15 = 45\n- Peppers: 20 x 15 = 300\n- Orange: 5 x 15 = 75\n- Total: 45 + 300 + 75 = 185\n\nSo, the total amount of money he will spend is $185.", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 128}
+{"task_id": 129, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 129}
+{"task_id": 130, "completion": "\n\n2. What is the name of the department store's Santa village?\n\n3. What is the name of the department store's Santa village?\n\n4. What is the name of the department store's Santa village?\n\n5. What is the name of the department store's Santa village?\n\n6. What is the name of the department store's Santa village?\n\n7. What is the name of the department store's Santa village?\n\n8. What is the name of the department store's Santa village?\n\n9. What is the name of", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 130}
+{"task_id": 131, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 131}
+{"task_id": 132, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 132}
+{"task_id": 133, "completion": " Answer: 41\nWalt walked 41 miles on Wednesday. His total mileage for the week was 285 miles. How many miles did he walk on Thursday? Answer: 285\nWalt walked 285 miles on Thursday. His total mileage for the week was 320 miles. How many miles did he walk on Friday? Answer: 320\nWalt walked 320 miles on Friday. His total mileage for the week was 356 miles. How many miles did he walk on Saturday? Answer", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 133}
+{"task_id": 134, "completion": "\n\nSolution:\n\n1. Calculate the number of car washes Tom gets per month:\n\n- Month 1: 1\n- Month 2: 1\n- Month 3: 1\n- Month 4: 1\n- Month 5: 1\n- Month 6: 1\n- Month 7: 1\n- Month 8: 1\n- Month 9: 1\n- Month 10: 1\n- Month 11: 1\n- Month 12: 1\n- Month 13", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 134}
+{"task_id": 135, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 135}
+{"task_id": 136, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 136}
+{"task_id": 137, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 137}
+{"task_id": 138, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 138}
+{"task_id": 139, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 139}
+{"task_id": 140, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 140}
+{"task_id": 141, "completion": " Answer: 1000\n\n2. There are 1000 bees in a hive. There are twice as many worker bees as baby bees, and there are twice as many baiees as queen bees.  How many worker bees are there? Answer: 2000\n\n3. There are 1000 bees in a hive. There are twice as many worker bees as baby bees, and there are twice as many baiees as queen bees.  How many worker bees are there? Answer: 400", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 141}
+{"task_id": 142, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 142}
+{"task_id": 143, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 143}
+{"task_id": 144, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 144}
+{"task_id": 145, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 145}
+{"task_id": 146, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 146}
+{"task_id": 147, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 147}
+{"task_id": 148, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 148}
+{"task_id": 149, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 149}
+{"task_id": 150, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 150}
+{"task_id": 151, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 151}
+{"task_id": 152, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 152}
+{"task_id": 153, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 153}
+{"task_id": 154, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 154}
+{"task_id": 155, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 155}
+{"task_id": 156, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 156}
+{"task_id": 157, "completion": "\nThe winner runs 100 yards more than the loser.", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 157}
+{"task_id": 158, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 158}
+{"task_id": 159, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 159}
+{"task_id": 160, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 160}
+{"task_id": 161, "completion": "", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 161}
+{"task_id": 162, "completion": "\n\nSolution:\n\nThe price of a bag of marbles after 36 months is calculated as follows:\n\nPrice of Marbles (in $) = (Original Price of Marbles * 12 Months) / 12 Months + (Original Price of Marbles * 2 Months) / 2 Months\n\nOriginal Price of Marbles = $20\nOriginal Price of Marbles * 12 Months = $280\nOriginal Price of Marbles * 2 Months = $", "method": "pure_edge", "run_id": "62626df8321b48b8a6033e18af30e66a", "sample_index": 162}

@@ -161,6 +161,8 @@ class Decoding(ABC):
         self._spec_token_indices_sent = set()
         self._token_time_ref = 0.0
         self._sample_token_durations = []
+        self._sample_decode_started_at = None
+        self._first_accepted_token_latency = None
         self.batch_trace = []
         self._speculative_round_id = 0
 
@@ -399,6 +401,14 @@ class Decoding(ABC):
         if len(committed) < remaining and final_token is not None:
             output_tokens.append(final_token)
             committed.append(final_token)
+        if (
+            committed
+            and getattr(self, '_first_accepted_token_latency', None) is None
+            and getattr(self, '_sample_decode_started_at', None) is not None
+        ):
+            self._first_accepted_token_latency = max(
+                0.0, time.perf_counter() - self._sample_decode_started_at
+            )
         self._record_token_time(len(committed))
         return len(committed)
 
@@ -674,6 +684,7 @@ class Decoding(ABC):
         # cloud prompt initialization, and the initial DP plan are ready.
         self._token_time_ref = time.time()
         total_start_time = self._token_time_ref
+        self._sample_decode_started_at = time.perf_counter()
         while len(output_tokens) < self.max_len:
 
             # --- 1. 生成一个token ---
@@ -1198,6 +1209,7 @@ class Decoding(ABC):
             'thresh_multi': self.verify_thresh_multi,
             'verify_stats': verify_stats,
             'token_durations': list(self._sample_token_durations),
+            'time_to_first_token_seconds': self._first_accepted_token_latency,
             'avg_token_time': avg_token_time,
             'gpu_power_integral_joules': exit_result.get('gpu_power_integral_joules', None),
             'verify_num': exit_result.get('verify_num', None),

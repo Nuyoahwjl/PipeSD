@@ -401,6 +401,11 @@ class CloudEdgeSpeculativeEval(Decoding):
             for item in sample_results
             for duration in item.get("token_durations", [])
         ]
+        ttft = [
+            float(item["time_to_first_token_seconds"])
+            for item in sample_results
+            if item.get("time_to_first_token_seconds") is not None
+        ]
         num_verifications = sum(
             int(item.get("verify_stats", {}).get("num_verifications", 0))
             for item in sample_results
@@ -423,9 +428,15 @@ class CloudEdgeSpeculativeEval(Decoding):
             for batch in item.get("batch_trace", [])
             if int(batch.get("actual_batch_size", 0)) > 0
         ]
-        total_energy = sum(
-            float(item.get("gpu_power_integral_joules") or 0.0)
+        measured_energy = [
+            float(item["gpu_power_integral_joules"])
             for item in sample_results
+            if item.get("gpu_power_integral_joules") is not None
+        ]
+        total_energy = (
+            sum(measured_energy)
+            if len(measured_energy) == len(sample_results)
+            else None
         )
         return {
             "evaluation_protocol": self.args.evaluation_protocol,
@@ -438,6 +449,9 @@ class CloudEdgeSpeculativeEval(Decoding):
             "weighted_tpt_ms": 1000.0 * total_time / actual_tokens if actual_tokens else None,
             "token_latency_p50_seconds": self._percentile(durations, 0.50),
             "token_latency_p95_seconds": self._percentile(durations, 0.95),
+            "token_latency_p99_seconds": self._percentile(durations, 0.99),
+            "mean_ttft_seconds": statistics.fmean(ttft) if ttft else None,
+            "ttft_p95_seconds": self._percentile(ttft, 0.95),
             "num_verifications": num_verifications,
             "verification_frequency": num_verifications / actual_tokens if actual_tokens else None,
             "mean_draft_length": draft_tokens / num_verifications if num_verifications else None,
@@ -451,7 +465,11 @@ class CloudEdgeSpeculativeEval(Decoding):
             ),
             "eos_count": sum(1 for item in sample_results if item.get("ended_with_eos")),
             "gpu_energy_joules": total_energy,
-            "gpu_energy_joules_per_100_tokens": 100.0 * total_energy / actual_tokens if actual_tokens else None,
+            "gpu_energy_joules_per_100_tokens": (
+                100.0 * total_energy / actual_tokens
+                if total_energy is not None and actual_tokens
+                else None
+            ),
         }
 
     def _paper_result_path(self):

@@ -239,14 +239,39 @@ class RunEdgeTests(unittest.TestCase):
         evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
         evaluator.args = SimpleNamespace(evaluation_protocol="paper_table1", target_output_tokens=10)
         results = [
-            {"output_length": 2, "total_time": 1.0, "token_durations": [0.5, 0.5]},
-            {"output_length": 8, "total_time": 2.0, "token_durations": [0.25] * 8},
+            {
+                "output_length": 2,
+                "total_time": 1.0,
+                "token_durations": [0.5, 0.5],
+                "time_to_first_token_seconds": 0.8,
+                "gpu_power_integral_joules": 2.0,
+            },
+            {
+                "output_length": 8,
+                "total_time": 2.0,
+                "token_durations": [0.25] * 8,
+                "time_to_first_token_seconds": 0.4,
+                "gpu_power_integral_joules": 8.0,
+            },
         ]
 
         summary = evaluator._build_run_summary(results)
 
         self.assertEqual(summary["actual_output_tokens"], 10)
         self.assertAlmostEqual(summary["weighted_tpt_seconds"], 0.3)
+        self.assertAlmostEqual(summary["mean_ttft_seconds"], 0.6)
+        self.assertAlmostEqual(summary["gpu_energy_joules_per_100_tokens"], 100.0)
+
+    def test_run_summary_does_not_turn_missing_energy_into_zero(self):
+        evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+        evaluator.args = SimpleNamespace(evaluation_protocol="paper_table1", target_output_tokens=2)
+
+        summary = evaluator._build_run_summary([
+            {"output_length": 2, "total_time": 1.0, "token_durations": [0.5, 0.5]}
+        ])
+
+        self.assertIsNone(summary["gpu_energy_joules"])
+        self.assertIsNone(summary["gpu_energy_joules_per_100_tokens"])
 
     def test_paper_table1_stops_exactly_at_token_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -347,6 +372,8 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(decoder.verify_num, 3)
         self.assertEqual(decoder._spec_token_indices_generated, [])
         self.assertEqual(decoder._spec_token_indices_sent, set())
+        self.assertIsNone(decoder._sample_decode_started_at)
+        self.assertIsNone(decoder._first_accepted_token_latency)
         self.assertFalse(decoder.sender.kwargs["use_env_proxy"])
         self.assertIsNot(decoder.sender, decoder.proactive_sender)
         self.assertIs(decoder.sender.kwargs["link"], decoder.proactive_sender.kwargs["link"])
@@ -461,6 +488,25 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(committed, 2)
         self.assertEqual(output_tokens, [10, 11, 12, 13, 20, 21])
         self.assertEqual(len(decoder._token_durations), 2)
+
+    def test_first_accepted_token_latency_is_recorded_before_chunk_averaging(self):
+        decoder = DummyDecoding(make_args())
+        decoder.max_len = 10
+        decoder._token_durations = []
+        decoder._run_token_durations = decoder._token_durations
+        decoder._sample_token_durations = []
+        decoder._token_time_ref = 100.0
+        decoder._sample_decode_started_at = 50.0
+        decoder._first_accepted_token_latency = None
+
+        with mock.patch("src.engine.time.perf_counter", return_value=51.25), mock.patch(
+            "src.engine.time.time", return_value=102.0
+        ):
+            decoder._commit_verified_tokens(
+                [1, 2], speculative_tokens=[3, 4], n_accepted=2, final_token=5
+            )
+
+        self.assertAlmostEqual(decoder._first_accepted_token_latency, 1.25)
 
     def test_generation_budget_forces_verification_before_final_token_slot(self):
         decoder = DummyDecoding(make_args())

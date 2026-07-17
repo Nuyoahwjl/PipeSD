@@ -126,14 +126,16 @@ NETWORK_SHAPING_MODE=software SEED=1234 TARGET_OUTPUT_TOKENS=1000 RESULT_TAG=tab
 cd edge
 python scripts/summarize_table1.py exp/exp__wjl \
   --network-implementation current_software \
-  --output table1_summary.json \
-  --humaneval-jsonl humaneval_completions.jsonl
+  --result-tag table1_s1_paper \
+  --bandwidth-mbps 2.5
 ```
 
-汇总器输出每方法 TPT 均值/标准差、PipeSD speedup、与论文值的相对误差、tokens、验证频率、
-平均 draft length、接受率、rollback rate，以及 GSM8K exact match。HumanEval completion 会导出
-为 JSONL；按 HumanEval 官方 evaluator 运行 pass@1。为避免把不同方法混在同一 pass@1 中，
-实际评估时按 `method` 和 `run_id` 拆分该 JSONL。
+汇总器针对每个数据集选择同一 result tag、带宽和网络实现下每种算法最新的正式结果，分别输出到
+`exp/exp__wjl/<dataset>/comparison/`。输出包含 Markdown、CSV、JSON，以及每种算法独立的
+completion JSONL。报告覆盖 TPT、吞吐、P50/P95/P99、TTFT、GPU 能耗、样本波动、NAV、
+draft length、接受率、rollback、batch、proactive 复用/废弃、网络流量/排队时间、终止状态、
+可比性警告；completion 只保存，不计算 pass@1 或 exact match。由于复现实验和论文使用的机器不同，
+汇总报告不直接比较绝对 TPT，也不计算相对论文值的误差。
 
 先跑 100-token pilot：
 
