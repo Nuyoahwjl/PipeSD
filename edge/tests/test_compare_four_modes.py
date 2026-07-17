@@ -110,6 +110,78 @@ class CompareFourModesTest(unittest.TestCase):
         )
         self.assertTrue(any("excludes client-cloud transfer" in item for item in warnings))
 
+    def test_normalize_result_derives_average_power_from_energy_and_total_time(self):
+        payload = {
+            "manifest": {
+                "algorithm": "pure_cloud",
+                "run_id": "run-power",
+                "seed": 1,
+                "result_tag": "x",
+            },
+            "summary": {
+                "actual_output_tokens": 1000,
+                "total_time_seconds": 4.0,
+                "weighted_tpt_ms": 4.0,
+                "model_energy_joules": 1600.0,
+                "model_energy_joules_per_100_tokens": 160.0,
+            },
+            "samples": [],
+        }
+
+        row = MODULE.normalize_result(Path("pure-cloud.json"), payload)
+
+        self.assertEqual(row["average_power_watts"], 400.0)
+        self.assertEqual(row["power_time_seconds"], 4.0)
+        self.assertEqual(
+            row["power_calculation"], "energy_joules / total_time_seconds"
+        )
+
+    def test_markdown_explains_thousand_token_tpt_identity_and_power(self):
+        rows = [
+            {
+                "method": "pure_cloud",
+                "display_name": "Pure Cloud (model-only)",
+                "actual_tokens": 1000,
+                "tpt_ms": 4.0,
+                "throughput_tokens_per_second": 250.0,
+                "total_time_seconds": 4.0,
+                "token_latency_p50_ms": 4.0,
+                "token_latency_p95_ms": 4.0,
+                "token_latency_p99_ms": 4.0,
+                "mean_ttft_ms": 4.0,
+                "energy_joules_per_100_tokens": 160.0,
+                "average_power_watts": 400.0,
+                "energy_scope": "cloud_gpu",
+                "nav_per_100_tokens": None,
+                "mean_draft_length": None,
+                "acceptance_rate": None,
+                "rollback_rate": None,
+                "mean_actual_batch_size": None,
+                "uplink_bytes": None,
+                "uplink_mib_per_100_tokens": None,
+                "uplink_transfers": None,
+                "average_uplink_transfer_kib": None,
+                "downlink_bytes": None,
+                "network_queue_wait_seconds": None,
+                "network_service_seconds": None,
+                "cap_hit_rate": 1.0,
+                "eos_rate": 0.0,
+                "run_id": "run-power",
+                "git_commit": "abc",
+                "seed": 1,
+                "network_shaping_mode": None,
+                "network_emulator_version": None,
+                "uplink_bandwidth_MBps": None,
+                "downlink_bandwidth_MBps": None,
+            }
+        ]
+
+        markdown = MODULE.build_markdown("humaneval", rows, [])
+
+        self.assertIn("exactly 1,000 output tokens", markdown)
+        self.assertIn("Avg power W", markdown)
+        self.assertIn("400.000", markdown)
+
     def test_default_output_is_beside_dataset_experiments(self):
         self.assertEqual(
             MODULE.resolve_output_dir("gsm8k", "four_mode_s1_paper"),

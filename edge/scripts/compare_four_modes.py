@@ -189,6 +189,11 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         energy = summary.get("gpu_energy_joules")
     if energy_per_100 is None:
         energy_per_100 = summary.get("gpu_energy_joules_per_100_tokens")
+    average_power_watts = (
+        float(energy) / total_time
+        if energy is not None and total_time > 0.0
+        else None
+    )
     method = str(manifest["algorithm"])
     network = aggregate_network(samples)
     network_emulation = manifest.get("network_emulation") or {}
@@ -235,6 +240,13 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         ) if ttft or summary.get("mean_ttft_seconds") is not None else None,
         "energy_joules": energy,
         "energy_joules_per_100_tokens": energy_per_100,
+        "average_power_watts": average_power_watts,
+        "power_time_seconds": total_time if average_power_watts is not None else None,
+        "power_calculation": (
+            "energy_joules / total_time_seconds"
+            if average_power_watts is not None
+            else None
+        ),
         "energy_scope": summary.get("energy_scope", "cloud_gpu" if method != "pure_edge" else "edge_cpu_package"),
         "energy_source": summary.get("energy_source", "cloud_service_nvml" if energy is not None else "unavailable"),
         "verification_frequency": summary.get("verification_frequency"),
@@ -340,6 +352,10 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
                 row["energy_joules_per_100_tokens"],
                 none_label="N/A" if row["method"] == "pure_edge" else "missing",
             ),
+            fmt(
+                row["average_power_watts"],
+                none_label="N/A" if row["method"] == "pure_edge" else "missing",
+            ),
             row["energy_scope"],
             fmt_for_method(row, row["nav_per_100_tokens"], applies_to="collaborative"),
             fmt_for_method(row, row["mean_draft_length"], applies_to="collaborative"),
@@ -406,6 +422,15 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
         "",
         "## Latency and throughput",
         "",
+        (
+            "> Every selected run contains exactly 1,000 output tokens, so TPT in "
+            "ms/token is numerically equal to total measured time in seconds: "
+            "TPT = total_time_seconds × 1000 / 1000. The report retains both "
+            "columns and the general token-normalized definition."
+            if rows and all(row.get("actual_tokens") == 1000 for row in rows)
+            else "> TPT is token-normalized: TPT(ms/token) = total_time_seconds × 1000 / actual_tokens."
+        ),
+        "",
         markdown_table(
             ["Method", "TPT ms↓", "token/s↑", "vs Serial↑", "Total s↓", "P50 ms↓", "P95 ms↓", "P99 ms↓", "TTFT ms↓"],
             common,
@@ -413,8 +438,10 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
         "",
         "## Energy and speculative-decoding behavior",
         "",
+        "> Average power is derived as measured energy divided by reported total time. The result artifacts do not store a separate NVML sampling-window duration.",
+        "",
         markdown_table(
-            ["Method", "Measured energy J/100↓", "Energy scope", "NAV/100↓", "Draft len", "Accept↑", "Rollback↓", "Batch size"],
+            ["Method", "Measured energy J/100↓", "Avg power W↓", "Energy scope", "NAV/100↓", "Draft len", "Accept↑", "Rollback↓", "Batch size"],
             efficiency,
         ),
         "",
@@ -489,7 +516,7 @@ def resolve_output_dir(
     if explicit is not None:
         return explicit
     return (
-        Path("exp/exp__wjl")
+        Path("exp/exp__wjl__four__modes")
         / dataset
         / "comparison"
         / (result_tag_value or "latest")
@@ -552,7 +579,11 @@ def main():
         with (output_dir / f"four_mode_{dataset}.csv").open(
             "w", encoding="utf-8", newline=""
         ) as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=list(rows[0].keys()),
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(rows)
         markdown = build_markdown(dataset, rows, warnings)

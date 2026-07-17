@@ -13,6 +13,8 @@
 
 ## Latency and throughput
 
+> Every selected run contains exactly 1,000 output tokens, so TPT in ms/token is numerically equal to total measured time in seconds: TPT = total_time_seconds × 1000 / 1000. The report retains both columns and the general token-normalized definition.
+
 | Method | TPT ms↓ | token/s↑ | vs Serial↑ | Total s↓ | P50 ms↓ | P95 ms↓ | P99 ms↓ | TTFT ms↓ |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Pure Cloud (model-only) | 4.068 | 245.795 | 127.440 | 4.068 | 3.991 | 4.269 | 4.807 | 6.693 |
@@ -22,12 +24,14 @@
 
 ## Energy and speculative-decoding behavior
 
-| Method | Measured energy J/100↓ | Energy scope | NAV/100↓ | Draft len | Accept↑ | Rollback↓ | Batch size |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Pure Cloud (model-only) | 168.247 | cloud_gpu | — | — | — | — | — |
-| Pure Edge (local-only) | N/A | edge_cpu_package | — | — | — | — | — |
-| Serial Edge-Cloud SD | 4930.713 | cloud_gpu | 19.400 | 5.866 | 70.9% | 44.8% | 5.866 |
-| PipeSD | 3849.947 | cloud_gpu | 15.600 | 5.808 | 93.7% | 20.5% | 1.742 |
+> Average power is derived as measured energy divided by reported total time. The result artifacts do not store a separate NVML sampling-window duration.
+
+| Method | Measured energy J/100↓ | Avg power W↓ | Energy scope | NAV/100↓ | Draft len | Accept↑ | Rollback↓ | Batch size |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Pure Cloud (model-only) | 168.247 | 413.543 | cloud_gpu | — | — | — | — | — |
+| Pure Edge (local-only) | N/A | N/A | edge_cpu_package | — | — | — | — | — |
+| Serial Edge-Cloud SD | 4930.713 | 95.099 | cloud_gpu | 19.400 | 5.866 | 70.9% | 44.8% | 5.866 |
+| PipeSD | 3849.947 | 97.924 | cloud_gpu | 15.600 | 5.808 | 93.7% | 20.5% | 1.742 |
 
 ## Network behavior
 
