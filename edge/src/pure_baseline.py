@@ -2,9 +2,9 @@
 
 This module intentionally does not depend on :mod:`src.engine`.  The two pure
 deployment baselines must not initialize the speculative-decoding transport,
-create a cloud task, or execute NAV.  Keeping the implementation separate also
-makes their timing boundary explicit: prompt prefill is reported separately and
-TPT covers decode only, matching the collaborative runner's measured region.
+create a cloud task, or execute NAV. Keeping the implementation separate also
+makes their timing boundary explicit: TPT covers the complete warm-model local
+request while prompt prefill and decode are retained as diagnostic sub-stages.
 """
 
 from __future__ import annotations
@@ -44,6 +44,35 @@ DEFAULT_MODELS = {
         "gsm8k": "../cloud/pre_models/Llama-2-7b-Chat-GGUF/llama-2-7b-chat.Q4_K_M.gguf",
     },
 }
+
+MODE_RUNTIME_DEFAULTS = {
+    # Match the Edge draft-model defaults in edge/src/util.py.
+    "pure_edge": {
+        "seed": 3407,
+        "threads": 1,
+        "ctx_size": 1024,
+        "temp": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    },
+    # Match the Cloud target-model defaults in cloud/src/util.py.
+    "pure_cloud": {
+        "seed": 3407,
+        "threads": 1,
+        "ctx_size": 1024,
+        "temp": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    },
+}
+
+
+def resolve_runtime_defaults(args) -> None:
+    """Fill unspecified pure-baseline settings from the matching model role."""
+    defaults = MODE_RUNTIME_DEFAULTS[args.mode]
+    for name, value in defaults.items():
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
 
 
 def percentile(values: Sequence[float], fraction: float) -> Optional[float]:
@@ -124,13 +153,14 @@ def load_samples(
 
 
 class NVMLPowerMeter:
-    """Integrate GPU board power during a measured decode interval."""
+    """Integrate GPU board power during a measured model-compute interval."""
 
     source = "nvml_gpu_board_power"
 
     def __init__(self, device_index: int = 0, sample_interval: float = 0.005):
         self.sample_interval = max(0.001, float(sample_interval))
         self.handle = None
+        self.last_measurement_duration_seconds: Optional[float] = None
         if pynvml is not None:
             try:
                 pynvml.nvmlInit()
@@ -148,7 +178,6 @@ class NVMLPowerMeter:
             return function(), None
         samples: List[Tuple[float, float]] = []
         stop_event = threading.Event()
-
         def read_power() -> None:
             try:
                 samples.append(
@@ -171,6 +200,10 @@ class NVMLPowerMeter:
             stop_event.set()
             thread.join()
 
+        self.last_measurement_duration_seconds = (
+            samples[-1][0] - samples[0][0] if len(samples) >= 2 else None
+        )
+
         energy = sum(
             (power_a + power_b) * 0.5 * (time_b - time_a)
             for (time_a, power_a), (time_b, power_b) in zip(samples, samples[1:])
@@ -179,62 +212,29 @@ class NVMLPowerMeter:
         return result, energy if len(samples) >= 2 else None
 
 
-class RaplEnergyMeter:
-    """Read top-level Intel RAPL package counters when the OS exposes them."""
-
-    source = "intel_rapl_package"
-
-    def __init__(self, root: Path = Path("/sys/class/powercap")):
-        self.domains = []
-        for domain in sorted(root.glob("intel-rapl:[0-9]*")):
-            energy_path = domain / "energy_uj"
-            if not energy_path.is_file():
-                continue
-            max_path = domain / "max_energy_range_uj"
-            try:
-                maximum = int(max_path.read_text().strip()) if max_path.is_file() else None
-                int(energy_path.read_text().strip())
-            except (OSError, ValueError):
-                continue
-            self.domains.append((energy_path, maximum))
-
-    @property
-    def available(self) -> bool:
-        return bool(self.domains)
-
-    def _snapshot(self) -> List[int]:
-        return [int(path.read_text().strip()) for path, _ in self.domains]
-
-    def measure(self, function):
-        if not self.available:
-            return function(), None
-        before = self._snapshot()
-        result = function()
-        after = self._snapshot()
-        delta = 0
-        for start, end, (_, maximum) in zip(before, after, self.domains):
-            if end >= start:
-                delta += end - start
-            elif maximum is not None:
-                delta += maximum - start + end
-        return result, delta / 1_000_000.0
-
-
 class NullEnergyMeter:
     source = "unavailable"
     available = False
+    last_measurement_duration_seconds = None
 
     @staticmethod
     def measure(function):
         return function(), None
 
 
-def select_energy_meter(mode: str, gpu_device: int, sample_interval: float):
+def select_energy_meter(
+    mode: str,
+    gpu_device: int,
+    sample_interval: float,
+    n_gpu_layers: int = 0,
+):
     if mode == "pure_cloud":
         meter = NVMLPowerMeter(gpu_device, sample_interval)
-    else:
-        meter = RaplEnergyMeter()
-    return meter if meter.available else NullEnergyMeter()
+        return meter if meter.available else NullEnergyMeter()
+    # Pure Edge energy is intentionally not measured.  RAPL commonly requires
+    # privileges that are unavailable on the evaluation edge host, and silently
+    # mixing partial CPU/GPU scopes would make the four-mode table misleading.
+    return NullEnergyMeter()
 
 
 @dataclass
@@ -252,16 +252,34 @@ def generate_one(
     config: GenerationConfig,
     energy_meter,
 ) -> Dict[str, Any]:
-    """Run one local autoregressive sample with prefill outside decode TPT."""
+    """Run one local autoregressive sample.
+
+    TPT covers warm-model request processing end to end (reset/tokenization,
+    prompt prefill, decode, and detokenization). Model energy, when enabled for
+    Pure Cloud, continuously covers prompt prefill plus complete decode.
+    """
+    preprocess_started = time.perf_counter()
     model.reset()
     prefix_tokens = model.tokenize(prompt.encode("utf-8"), add_bos=True)
-    prefill_started = time.perf_counter()
-    model.eval(prefix_tokens)
-    prefill_time = time.perf_counter() - prefill_started
+    request_preprocess_time = time.perf_counter() - preprocess_started
     generated_tokens: List[int] = []
     durations: List[float] = []
+    prefill_time = 0.0
+    decode_time = 0.0
 
-    def decode() -> float:
+    def prefill_compute() -> None:
+        nonlocal prefill_time
+        prefill_started = time.perf_counter()
+        model.eval(prefix_tokens)
+        prefill_time = time.perf_counter() - prefill_started
+
+    _, prompt_prefill_energy_joules = energy_meter.measure(prefill_compute)
+    prompt_prefill_energy_duration = getattr(
+        energy_meter, "last_measurement_duration_seconds", None
+    )
+
+    def decode_compute() -> None:
+        nonlocal decode_time
         started = time.perf_counter()
         limit = min(config.max_generated_tokens, max(0, int(token_budget)))
         while len(generated_tokens) < limit:
@@ -278,17 +296,48 @@ def generate_one(
             generated_tokens.append(token)
             if token == model.token_eos():
                 break
-        return time.perf_counter() - started
+        decode_time = time.perf_counter() - started
 
-    decode_time, energy_joules = energy_meter.measure(decode)
+    _, decode_energy_joules = energy_meter.measure(decode_compute)
+    decode_energy_duration = getattr(
+        energy_meter, "last_measurement_duration_seconds", None
+    )
+    energy_joules = (
+        float(prompt_prefill_energy_joules) + float(decode_energy_joules)
+        if prompt_prefill_energy_joules is not None
+        and decode_energy_joules is not None
+        else None
+    )
+    energy_duration = (
+        float(prompt_prefill_energy_duration) + float(decode_energy_duration)
+        if prompt_prefill_energy_duration is not None
+        and decode_energy_duration is not None
+        else None
+    )
+    postprocess_started = time.perf_counter()
     continuation = model.detokenize(generated_tokens).decode("utf-8", "ignore")
     full_text = model.detokenize(prefix_tokens + generated_tokens).decode("utf-8", "ignore")
+    output_postprocess_time = time.perf_counter() - postprocess_started
+    end_to_end_time = (
+        request_preprocess_time
+        + prefill_time
+        + decode_time
+        + output_postprocess_time
+    )
     ended_with_eos = bool(generated_tokens and generated_tokens[-1] == model.token_eos())
     return {
         "output_length": len(generated_tokens),
-        "total_time": decode_time,
+        "total_time": end_to_end_time,
+        "end_to_end_time_seconds": end_to_end_time,
+        "request_preprocess_time_seconds": request_preprocess_time,
         "prefill_time_seconds": prefill_time,
-        "time_to_first_token_seconds": durations[0] if durations else None,
+        "decode_time_seconds": decode_time,
+        "output_postprocess_time_seconds": output_postprocess_time,
+        "time_to_first_token_seconds": (
+            request_preprocess_time + prefill_time + durations[0]
+            if durations
+            else None
+        ),
         "token_durations": durations,
         "output": full_text,
         "generated_text": continuation,
@@ -301,6 +350,20 @@ def generate_one(
             and not ended_with_eos
         ),
         "model_energy_joules": energy_joules,
+        "prompt_prefill_gpu_energy_joules": prompt_prefill_energy_joules,
+        "decode_gpu_energy_joules": decode_energy_joules,
+        "energy_measurement_duration_seconds": energy_duration,
+        "prompt_prefill_energy_measurement_duration_seconds": (
+            prompt_prefill_energy_duration
+        ),
+        "decode_energy_measurement_duration_seconds": decode_energy_duration,
+        "energy_scope": "model_prompt_prefill_plus_autoregressive_decode",
+        "energy_included_stages": ["prompt_prefill", "autoregressive_decode"],
+        "energy_excluded_stages": [
+            "model_load",
+            "prompt_tokenization",
+            "output_detokenization",
+        ],
         "energy_source": energy_meter.source,
         "verify_stats": {"num_verifications": 0},
         "verify_spec_lengths": [],
@@ -333,7 +396,78 @@ def build_summary(
         if sample.get("model_energy_joules") is not None
     ]
     energy = sum(measured_energy) if len(measured_energy) == len(sample_results) else None
+    measured_prefill_energy = [
+        float(sample["prompt_prefill_gpu_energy_joules"])
+        for sample in sample_results
+        if sample.get("prompt_prefill_gpu_energy_joules") is not None
+    ]
+    prompt_prefill_energy = (
+        sum(measured_prefill_energy)
+        if len(measured_prefill_energy) == len(sample_results)
+        else None
+    )
+    measured_decode_energy = [
+        float(sample["decode_gpu_energy_joules"])
+        for sample in sample_results
+        if sample.get("decode_gpu_energy_joules") is not None
+    ]
+    decode_energy = (
+        sum(measured_decode_energy)
+        if len(measured_decode_energy) == len(sample_results)
+        else None
+    )
+    measured_prefill_energy_durations = [
+        float(sample["prompt_prefill_energy_measurement_duration_seconds"])
+        for sample in sample_results
+        if sample.get("prompt_prefill_energy_measurement_duration_seconds")
+        is not None
+    ]
+    prompt_prefill_energy_duration = (
+        sum(measured_prefill_energy_durations)
+        if len(measured_prefill_energy_durations) == len(sample_results)
+        else None
+    )
+    measured_decode_energy_durations = [
+        float(sample["decode_energy_measurement_duration_seconds"])
+        for sample in sample_results
+        if sample.get("decode_energy_measurement_duration_seconds") is not None
+    ]
+    decode_energy_duration = (
+        sum(measured_decode_energy_durations)
+        if len(measured_decode_energy_durations) == len(sample_results)
+        else None
+    )
+    measured_energy_durations = [
+        float(sample["energy_measurement_duration_seconds"])
+        for sample in sample_results
+        if sample.get("energy_measurement_duration_seconds") is not None
+    ]
+    energy_duration = (
+        sum(measured_energy_durations)
+        if len(measured_energy_durations) == len(sample_results)
+        else None
+    )
     sources = sorted({sample.get("energy_source", "unavailable") for sample in sample_results})
+    if mode == "pure_edge":
+        energy = None
+        prompt_prefill_energy = None
+        decode_energy = None
+        prompt_prefill_energy_duration = None
+        decode_energy_duration = None
+        energy_duration = None
+        energy_scope = "not_measured_no_rapl_permission"
+        energy_source: Any = "not_measured"
+        energy_included_stages: List[str] = []
+        energy_excluded_stages = ["all_pure_edge_energy"]
+    else:
+        energy_scope = "cloud_gpu_prompt_prefill_plus_autoregressive_decode"
+        energy_source = sources[0] if len(sources) == 1 else sources
+        energy_included_stages = ["prompt_prefill", "autoregressive_decode"]
+        energy_excluded_stages = [
+            "model_load",
+            "prompt_tokenization",
+            "output_detokenization",
+        ]
     summary = {
         "evaluation_protocol": "paper_table1",
         "target_output_tokens": int(target_tokens),
@@ -341,6 +475,8 @@ def build_summary(
         "sample_indices": [sample.get("sample_index") for sample in sample_results],
         "num_samples": len(sample_results),
         "total_time_seconds": total_time,
+        "timing_scope": "warm_model_request_end_to_end_excluding_model_load",
+        "tpt_normalization_token_type": "committed_output_tokens",
         "weighted_tpt_seconds": total_time / actual_tokens if actual_tokens else None,
         "weighted_tpt_ms": 1000.0 * total_time / actual_tokens if actual_tokens else None,
         "throughput_tokens_per_second": actual_tokens / total_time if total_time else None,
@@ -351,6 +487,17 @@ def build_summary(
         "ttft_p95_seconds": percentile(ttft, 0.95),
         "total_prefill_time_seconds": sum(
             float(sample.get("prefill_time_seconds", 0.0)) for sample in sample_results
+        ),
+        "total_decode_time_seconds": sum(
+            float(sample.get("decode_time_seconds", 0.0)) for sample in sample_results
+        ),
+        "total_request_preprocess_time_seconds": sum(
+            float(sample.get("request_preprocess_time_seconds", 0.0))
+            for sample in sample_results
+        ),
+        "total_output_postprocess_time_seconds": sum(
+            float(sample.get("output_postprocess_time_seconds", 0.0))
+            for sample in sample_results
         ),
         "num_verifications": None,
         "verification_frequency": None,
@@ -367,23 +514,34 @@ def build_summary(
         ),
         "eos_count": sum(bool(sample.get("ended_with_eos")) for sample in sample_results),
         "model_energy_joules": energy,
+        "prompt_prefill_gpu_energy_joules": prompt_prefill_energy,
+        "decode_gpu_energy_joules": decode_energy,
+        "prompt_prefill_energy_measurement_duration_seconds": (
+            prompt_prefill_energy_duration
+        ),
+        "decode_energy_measurement_duration_seconds": decode_energy_duration,
         "model_energy_joules_per_100_tokens": (
             100.0 * energy / actual_tokens if energy is not None and actual_tokens else None
         ),
-        "energy_scope": "cloud_gpu" if mode == "pure_cloud" else "edge_cpu_package",
-        "energy_source": sources[0] if len(sources) == 1 else sources,
+        "energy_measurement_duration_seconds": energy_duration,
+        "average_model_compute_power_watts": (
+            energy / energy_duration
+            if energy is not None and energy_duration
+            else None
+        ),
+        "energy_scope": energy_scope,
+        "energy_source": energy_source,
+        "energy_normalization_token_type": "committed_output_tokens",
+        "energy_included_stages": energy_included_stages,
+        "energy_excluded_stages": energy_excluded_stages,
         "gpu_energy_joules": energy if mode == "pure_cloud" else None,
         "gpu_energy_joules_per_100_tokens": (
             100.0 * energy / actual_tokens
             if mode == "pure_cloud" and energy is not None and actual_tokens
             else None
         ),
-        "edge_energy_joules": energy if mode == "pure_edge" else None,
-        "edge_energy_joules_per_100_tokens": (
-            100.0 * energy / actual_tokens
-            if mode == "pure_edge" and energy is not None and actual_tokens
-            else None
-        ),
+        "edge_energy_joules": None,
+        "edge_energy_joules_per_100_tokens": None,
     }
     return summary
 
@@ -392,6 +550,7 @@ class PureBaselineEvaluator:
     def __init__(self, args, model_factory=None, energy_meter=None):
         self.args = args
         self.mode = args.mode
+        resolve_runtime_defaults(args)
         self.dataset = args.dataset.lower()
         self.run_id = args.run_id or uuid.uuid4().hex
         self.data_path = Path(args.data_path or f"data/{self.dataset}.jsonl")
@@ -432,7 +591,10 @@ class PureBaselineEvaluator:
         self.model_load_seconds = time.time() - model_started
         self.n_gpu_layers = n_gpu_layers
         self.energy_meter = energy_meter or select_energy_meter(
-            self.mode, args.gpu_energy_device, args.energy_sample_interval
+            self.mode,
+            args.gpu_energy_device,
+            args.energy_sample_interval,
+            self.n_gpu_layers,
         )
 
     def _manifest(self) -> Dict[str, Any]:
@@ -452,7 +614,12 @@ class PureBaselineEvaluator:
             "seed": self.args.seed,
             "evaluation_protocol": "paper_table1",
             "target_output_tokens": self.args.target_output_tokens,
-            "timing_scope": "decode_only_prefill_reported_separately",
+            "timing_scope": "warm_model_request_end_to_end_excluding_model_load",
+            "energy_scope": (
+                "cloud_gpu_prompt_prefill_plus_autoregressive_decode"
+                if self.mode == "pure_cloud"
+                else "not_measured_no_rapl_permission"
+            ),
             "network_included": False,
             "model_path": str(self.model_path),
             "model_sha256": sha256_file(self.model_path),

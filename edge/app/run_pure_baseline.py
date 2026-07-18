@@ -24,9 +24,24 @@ def parse_arguments():
     parser.add_argument("--output_root", default="exp/exp__wjl")
     parser.add_argument("--result_tag", default="four_mode_s1_paper")
     parser.add_argument("--run_id", default="")
-    parser.add_argument("--seed", type=int, default=3407)
-    parser.add_argument("--threads", type=int, default=2)
-    parser.add_argument("--ctx_size", type=int, default=16384)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Defaults to 1234, matching both Edge and Cloud roles.",
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="Defaults to 2 for pure_edge and 1 for pure_cloud.",
+    )
+    parser.add_argument(
+        "--ctx_size",
+        type=int,
+        default=None,
+        help="Defaults to 16384 for pure_edge and 1024 for pure_cloud.",
+    )
     parser.add_argument(
         "--n_gpu_layers",
         type=int,
@@ -34,9 +49,14 @@ def parse_arguments():
         help="Defaults to 0 for pure_edge and -1 for pure_cloud.",
     )
     parser.add_argument("--max_generated_tokens", type=int, default=128)
-    parser.add_argument("--temp", type=float, default=0.0)
-    parser.add_argument("--top_k", type=int, default=1)
-    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--temp", type=float, default=None, help="Role-matched default: 0.0.")
+    parser.add_argument("--top_k", type=int, default=None, help="Role-matched default: 1.")
+    parser.add_argument(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Defaults to 0.95 for pure_edge and 1.0 for pure_cloud.",
+    )
     parser.add_argument("--start_index_of_sample", type=int, default=0)
     parser.add_argument("--end_index_of_sample", type=int, default=163)
     parser.add_argument("--max_samples", type=int, default=None)
