@@ -1,54 +1,54 @@
 # Table 1 Scenario 1 summary: humaneval
 
-> Lower is better for TPT, latency, energy, NAV, rollback, traffic, and queue time. Energy covers the cloud GPU only.
+> TPT, throughput, GPU J/100, NAV/100, and MiB/100 are normalized by cloud-accepted draft tokens. Token-latency percentiles and TTFT describe committed output tokens. Energy includes cloud prompt prefill and target-model NAV compute only.
 
 ## Conclusions
 
 - Best TPT: **PipeSD**.
-- Lowest recorded GPU energy per 100 tokens: **PipeSD**.
-- PipeSD speedup over the best baseline: **1.320x**.
+- Lowest recorded GPU energy per 100 accepted draft tokens: **PipeSD**.
+- PipeSD speedup over the best baseline: **1.249x**.
 
 ## Performance, latency, and energy
 
-| Method | TPT ms↓ | tok/s↑ | vs Vanilla↑ | GPU J/100↓ | Energy Δ | P50↓ | P95↓ | P99↓ | TTFT↓ | Sample CV↓ |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 516.587 | 1.936 | 1.000 | 4921.003 | 0.0% | 386.934 | 1278.710 | 2669.294 | missing | 13.7% |
-| HSL | 552.550 | 1.810 | 0.935 | 5417.605 | 10.1% | 451.951 | 957.246 | 1844.093 | missing | 17.1% |
-| EdgeLLM | 722.554 | 1.384 | 0.715 | 7174.303 | 45.8% | 800.672 | 1285.318 | 2157.378 | missing | 39.5% |
-| PipeSD | 391.419 | 2.555 | 1.320 | 3827.028 | -22.2% | 238.022 | 1064.176 | 1516.848 | missing | 12.1% |
+| Method | Accepted | Output | TPT ms/accepted↓ | accepted tok/s↑ | vs Vanilla↑ | GPU J/100 accepted↓ | Energy Δ | Output P50↓ | Output P95↓ | Output P99↓ | Output TTFT↓ | Sample accepted-TPT CV↓ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vanilla | 1000 | 1234 | 628.705 | 1.591 | 1.000 | 30.060 | 0.0% | 386.652 | 1266.437 | 2665.768 | 2593.122 | 16.5% |
+| HSL | 1000 | 1354 | 773.934 | 1.292 | 0.812 | 29.048 | -3.4% | 460.315 | 959.618 | 1867.952 | 1915.668 | 24.4% |
+| EdgeLLM | 1000 | 1567 | 1258.404 | 0.795 | 0.500 | 39.091 | 30.0% | 827.053 | 1290.572 | 2426.259 | 1989.173 | 43.1% |
+| PipeSD | 1000 | 1200 | 503.444 | 1.986 | 1.249 | 19.121 | -36.4% | 255.726 | 1140.075 | 1917.818 | 2101.268 | 32.1% |
 
 ## Speculative-decoding behavior
 
-| Method | Draft | Accept↑ | NAV/100↓ | Accepted/NAV↑ | Rollback↓ | Batch | Reuse | Discard | Discard rate↓ |
+| Method | Draft | Accept↑ | NAV/100 accepted↓ | Accepted/NAV↑ | Rollback↓ | Batch | Reuse | Discard | Discard rate↓ |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 5.866 | 70.9% | 19.400 | 4.160 | 44.8% | 5.866 | 0 | 0 | — |
-| HSL | 3.107 | 95.8% | 25.200 | 2.976 | 12.7% | 3.107 | 0 | 0 | — |
-| EdgeLLM | 2.614 | 78.6% | 32.900 | 2.055 | 9.4% | 2.206 | 274 | 139 | 33.7% |
-| PipeSD | 5.808 | 93.7% | 15.600 | 5.442 | 20.5% | 1.725 | 470 | 132 | 21.9% |
+| Vanilla | 5.881 | 72.0% | 23.600 | 4.237 | 42.8% | 5.881 | 0 | 0 | — |
+| HSL | 2.955 | 95.1% | 35.600 | 2.809 | 14.3% | 2.955 | 0 | 0 | — |
+| EdgeLLM | 2.597 | 66.8% | 57.600 | 1.736 | 11.5% | 2.245 | 401 | 354 | 46.9% |
+| PipeSD | 5.279 | 92.9% | 20.400 | 4.902 | 24.0% | 1.670 | 528 | 185 | 25.9% |
 
 ## Network behavior
 
-| Method | Upload MiB↓ | MiB/100↓ | Uploads↓ | Download KiB↓ | Queue s↓ | Service s↓ | Primary req | Proactive req |
+| Method | Upload MiB↓ | MiB/100 accepted↓ | Uploads↓ | Download KiB↓ | Queue s↓ | Service s↓ | Primary req | Proactive req |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 315.101 | 31.510 | 218 | 22.507 | 0.000 | 137.614 | 218 | 0 |
-| HSL | 216.824 | 21.682 | 276 | 28.645 | 0.000 | 97.844 | 276 | 0 |
-| EdgeLLM | 277.223 | 27.722 | 477 | 53.264 | 54.768 | 128.203 | 208 | 269 |
-| PipeSD | 330.131 | 33.013 | 656 | 66.966 | 35.943 | 154.870 | 316 | 340 |
+| Vanilla | 384.323 | 38.432 | 266 | 138.111 | 0.000 | 167.853 | 266 | 0 |
+| HSL | 291.317 | 29.132 | 389 | 204.548 | 0.000 | 131.921 | 389 | 0 |
+| EdgeLLM | 512.346 | 51.235 | 861 | 358.454 | 85.210 | 236.433 | 400 | 461 |
+| PipeSD | 401.036 | 40.104 | 823 | 181.584 | 39.848 | 188.789 | 409 | 414 |
 
 ## Runtime termination
 
-| Method | Cap hit | EOS | Total s | Avg GPU W |
-| --- | --- | --- | --- | --- |
-| Vanilla | 87.5% | 0 | 516.587 | 95.260 |
-| HSL | 87.5% | 0 | 552.550 | 98.047 |
-| EdgeLLM | 87.5% | 0 | 722.554 | 99.291 |
-| PipeSD | 87.5% | 0 | 391.419 | 97.773 |
+| Method | Cap hit | EOS | Total s | Active GPU s | Prefill J | NAV J | NAV mean J | NAV P95 J | Active GPU W |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vanilla | 90.0% | 0 | 628.705 | 3.198 | 28.107 | 272.488 | 1.155 | 1.305 | 93.983 |
+| HSL | 90.9% | 0 | 773.934 | 2.951 | 17.678 | 272.801 | 0.766 | 1.254 | 98.436 |
+| EdgeLLM | 92.3% | 0 | 1258.404 | 3.969 | 21.241 | 369.673 | 0.642 | 1.038 | 98.491 |
+| PipeSD | 90.0% | 0 | 503.444 | 1.978 | 15.521 | 175.687 | 0.861 | 1.359 | 96.674 |
 
 ## Comparability warnings
 
+- Sample-index sets differ; the comparison is not fully paired.
 - At least one artifact was produced from a dirty worktree.
-- At least one artifact predates true TTFT instrumentation.
 - The cloud target-model hash is missing from at least one artifact.
 - At least one method has only one matching run; no cross-run confidence interval is available.
 - The selected PipeSD run does not record a BO configuration path.
-- Energy covers the cloud GPU only; edge CPU, memory, network devices, and idle system power are excluded.
+- Energy follows the original-repository active-compute scope: cloud prompt prefill plus each target-model NAV. GPU idle between NAVs, edge-draft wait, network transfer, proactive wait/transfer, model load, and state restore/save are excluded.
