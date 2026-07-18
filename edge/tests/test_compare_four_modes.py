@@ -108,7 +108,7 @@ class CompareFourModesTest(unittest.TestCase):
                 }
             ]
         )
-        self.assertTrue(any("excludes client-cloud transfer" in item for item in warnings))
+        self.assertTrue(any("warm-model local request" in item for item in warnings))
 
     def test_normalize_result_derives_average_power_from_energy_and_total_time(self):
         payload = {
@@ -134,6 +134,96 @@ class CompareFourModesTest(unittest.TestCase):
         self.assertEqual(row["power_time_seconds"], 4.0)
         self.assertEqual(
             row["power_calculation"], "energy_joules / total_time_seconds"
+        )
+
+    def test_pure_edge_ignores_legacy_energy_measurements(self):
+        payload = {
+            "manifest": {
+                "algorithm": "pure_edge",
+                "run_id": "legacy-rapl",
+                "seed": 1,
+                "result_tag": "x",
+            },
+            "summary": {
+                "actual_output_tokens": 1000,
+                "total_time_seconds": 4.0,
+                "model_energy_joules": 100.0,
+                "energy_scope": "edge_cpu_package",
+                "energy_source": "intel_rapl_package",
+            },
+            "samples": [],
+        }
+
+        row = MODULE.normalize_result(Path("pure-edge.json"), payload)
+
+        self.assertIsNone(row["energy_joules"])
+        self.assertIsNone(row["energy_joules_per_100_tokens"])
+        self.assertIsNone(row["average_power_watts"])
+        self.assertEqual(row["energy_scope"], "not_measured_no_rapl_permission")
+        self.assertEqual(row["energy_source"], "not_measured")
+
+    def test_collaborative_tpt_uses_cloud_accepted_tokens(self):
+        payload = {
+            "manifest": {
+                "algorithm": "pipesd",
+                "run_id": "run-accepted-tpt",
+                "seed": 1,
+                "result_tag": "x",
+            },
+            "summary": {
+                "target_accepted_draft_tokens": 1000,
+                "actual_accepted_draft_tokens": 1000,
+                "actual_output_tokens": 1200,
+                "total_time_seconds": 4.0,
+                # Deliberately retain a legacy output-normalized value. The
+                # comparison script must recompute rather than trust it.
+                "weighted_tpt_ms": 4.0 / 1.2,
+                "model_energy_joules": 400.0,
+                "num_verifications": 200,
+            },
+            "samples": [],
+        }
+
+        row = MODULE.normalize_result(Path("pipesd.json"), payload)
+
+        self.assertEqual(row["actual_tokens"], 1000)
+        self.assertEqual(row["actual_output_tokens"], 1200)
+        self.assertEqual(
+            row["tpt_normalization_token_type"],
+            "cloud_accepted_draft_tokens",
+        )
+        self.assertAlmostEqual(row["tpt_ms"], 4.0)
+        self.assertAlmostEqual(row["throughput_tokens_per_second"], 250.0)
+        self.assertAlmostEqual(row["energy_joules_per_100_tokens"], 40.0)
+        self.assertAlmostEqual(row["nav_per_100_tokens"], 20.0)
+
+    def test_normalize_result_uses_active_energy_window_when_recorded(self):
+        payload = {
+            "manifest": {
+                "algorithm": "pipesd",
+                "run_id": "run-active-power",
+                "seed": 1,
+                "result_tag": "x",
+            },
+            "summary": {
+                "actual_accepted_draft_tokens": 1000,
+                "actual_output_tokens": 1000,
+                "total_time_seconds": 10.0,
+                "weighted_tpt_ms": 10.0,
+                "model_energy_joules": 400.0,
+                "model_energy_joules_per_100_tokens": 40.0,
+                "energy_measurement_duration_seconds": 2.0,
+            },
+            "samples": [],
+        }
+
+        row = MODULE.normalize_result(Path("pipesd.json"), payload)
+
+        self.assertEqual(row["average_power_watts"], 200.0)
+        self.assertEqual(row["power_time_seconds"], 2.0)
+        self.assertEqual(
+            row["power_calculation"],
+            "energy_joules / energy_measurement_duration_seconds",
         )
 
     def test_markdown_explains_thousand_token_tpt_identity_and_power(self):
@@ -173,14 +263,29 @@ class CompareFourModesTest(unittest.TestCase):
                 "network_emulator_version": None,
                 "uplink_bandwidth_MBps": None,
                 "downlink_bandwidth_MBps": None,
+                "actual_output_tokens": 1000,
+                "tpt_normalization_token_type": "committed_output_tokens",
             }
         ]
+        pure_edge = dict(rows[0])
+        pure_edge.update(
+            {
+                "method": "pure_edge",
+                "display_name": "Pure Edge (local-only)",
+                "energy_joules_per_100_tokens": None,
+                "average_power_watts": None,
+                "energy_scope": "not_measured_no_rapl_permission",
+            }
+        )
+        rows.append(pure_edge)
 
         markdown = MODULE.build_markdown("humaneval", rows, [])
 
-        self.assertIn("exactly 1,000 output tokens", markdown)
+        self.assertIn("exactly 1,000 benchmark-normalization tokens", markdown)
+        self.assertIn("Collaborative modes use cloud-accepted draft tokens", markdown)
         self.assertIn("Avg power W", markdown)
         self.assertIn("400.000", markdown)
+        self.assertIn("| Pure Edge (local-only) | -- | -- |", markdown)
 
     def test_default_output_is_beside_dataset_experiments(self):
         self.assertEqual(

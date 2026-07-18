@@ -144,7 +144,7 @@ def normalize_result(dataset, method, path, payload, candidate_count):
     arguments = manifest.get("arguments", {})
     summary = payload.get("summary", {})
     samples = payload.get("samples", [])
-    tokens = int(summary.get("actual_output_tokens", 0) or 0)
+    output_tokens = int(summary.get("actual_output_tokens", 0) or 0)
     total_time = float(summary.get("total_time_seconds", 0) or 0)
     durations = [
         float(value)
@@ -156,11 +156,6 @@ def normalize_result(dataset, method, path, payload, candidate_count):
         for sample in samples
         if sample.get("time_to_first_token_seconds") is not None
     ]
-    sample_tpts = [
-        1000 * float(sample["total_time"]) / int(sample["output_length"])
-        for sample in samples
-        if sample.get("output_length")
-    ]
     spec_tokens = sum(
         sum(int(value) for value in (sample.get("verify_spec_lengths") or []))
         for sample in samples
@@ -169,13 +164,72 @@ def normalize_result(dataset, method, path, payload, candidate_count):
         sum(int(value) for value in (sample.get("verify_accept_lengths") or []))
         for sample in samples
     )
+    target_accepted_tokens = int(
+        summary.get(
+            "target_accepted_draft_tokens",
+            summary.get("target_output_tokens", 0),
+        )
+        or 0
+    )
+    sample_accepted_tokens = [
+        sum(int(value) for value in (sample.get("verify_accept_lengths") or []))
+        for sample in samples
+    ]
+    sample_tpts = [
+        1000.0 * float(sample.get("total_time", 0.0)) / accepted
+        for sample, accepted in zip(samples, sample_accepted_tokens)
+        if accepted > 0
+    ]
+    zero_accepted_samples = sum(1 for accepted in sample_accepted_tokens if accepted == 0)
     nav_count = int(summary.get("num_verifications", 0) or 0)
     reused = sum(int(sample.get("reused_proactive_tokens", 0) or 0) for sample in samples)
     discarded = sum(
         int(sample.get("discarded_proactive_tokens", 0) or 0) for sample in samples
     )
-    energy = summary.get("gpu_energy_joules")
-    tpt_ms = summary.get("weighted_tpt_ms")
+    energy = summary.get("model_energy_joules")
+    if energy is None:
+        energy = summary.get("gpu_energy_joules")
+    prompt_prefill_energy = summary.get("prompt_prefill_gpu_energy_joules")
+    if prompt_prefill_energy is None:
+        values = [
+            float(sample["prompt_prefill_gpu_energy_joules"])
+            for sample in samples
+            if sample.get("prompt_prefill_gpu_energy_joules") is not None
+        ]
+        prompt_prefill_energy = sum(values) if len(values) == len(samples) else None
+    nav_energy = summary.get("nav_gpu_energy_joules")
+    if nav_energy is None:
+        values = [
+            float(sample["nav_gpu_energy_joules"])
+            for sample in samples
+            if sample.get("nav_gpu_energy_joules") is not None
+        ]
+        nav_energy = sum(values) if len(values) == len(samples) else None
+    energy_duration = summary.get("energy_measurement_duration_seconds")
+    if energy_duration is None:
+        values = [
+            float(sample["energy_measurement_duration_seconds"])
+            for sample in samples
+            if sample.get("energy_measurement_duration_seconds") is not None
+        ]
+        energy_duration = sum(values) if len(values) == len(samples) else None
+    nav_energy_values = [
+        float(measurement["energy_joules"])
+        for sample in samples
+        for measurement in (sample.get("nav_energy_trace") or [])
+        if measurement.get("energy_joules") is not None
+    ]
+    accepted_tpt_ms = (
+        1000.0 * total_time / accepted_tokens if accepted_tokens else None
+    )
+    output_tpt_ms = (
+        1000.0 * total_time / output_tokens if output_tokens else None
+    )
+    energy_per_100_accepted_tokens = (
+        100.0 * float(energy) / accepted_tokens
+        if energy is not None and accepted_tokens
+        else None
+    )
     sample_mean = statistics.fmean(sample_tpts) if sample_tpts else None
     sample_std = (
         statistics.stdev(sample_tpts)
@@ -195,11 +249,21 @@ def normalize_result(dataset, method, path, payload, candidate_count):
         "candidate_runs": candidate_count,
         "num_samples": len(samples),
         "sample_indices": summary.get("sample_indices", []),
-        "target_tokens": summary.get("target_output_tokens"),
-        "actual_tokens": tokens,
+        # Compatibility aliases now refer to the paper benchmark unit: cloud-
+        # accepted draft tokens. Explicit fields retain both token populations.
+        "target_tokens": target_accepted_tokens,
+        "actual_tokens": accepted_tokens,
+        "target_accepted_tokens": target_accepted_tokens,
+        "actual_accepted_tokens": accepted_tokens,
+        "actual_output_tokens": output_tokens,
+        "normalization_token_type": "cloud_accepted_draft_tokens",
         "total_time_seconds": total_time,
-        "tpt_ms": tpt_ms,
-        "throughput_tokens_per_second": safe_div(tokens, total_time),
+        "tpt_ms": accepted_tpt_ms,
+        "accepted_token_tpt_ms": accepted_tpt_ms,
+        "output_token_tpt_ms": output_tpt_ms,
+        "throughput_tokens_per_second": safe_div(accepted_tokens, total_time),
+        "accepted_tokens_per_second": safe_div(accepted_tokens, total_time),
+        "output_tokens_per_second": safe_div(output_tokens, total_time),
         "token_latency_p50_ms": 1000 * percentile(durations, 0.50) if durations else None,
         "token_latency_p95_ms": 1000 * percentile(durations, 0.95) if durations else None,
         "token_latency_p99_ms": 1000 * percentile(durations, 0.99) if durations else None,
@@ -210,13 +274,32 @@ def normalize_result(dataset, method, path, payload, candidate_count):
         "sample_tpt_min_ms": min(sample_tpts) if sample_tpts else None,
         "sample_tpt_max_ms": max(sample_tpts) if sample_tpts else None,
         "sample_tpt_p95_ms": percentile(sample_tpts, 0.95),
+        "zero_accepted_sample_count": zero_accepted_samples,
         "gpu_energy_joules": energy,
-        "gpu_energy_joules_per_100_tokens": summary.get("gpu_energy_joules_per_100_tokens"),
-        "average_gpu_power_watts": safe_div(energy, total_time),
-        "energy_scope": "cloud_gpu",
+        "prompt_prefill_gpu_energy_joules": prompt_prefill_energy,
+        "nav_gpu_energy_joules": nav_energy,
+        "gpu_energy_joules_per_100_tokens": energy_per_100_accepted_tokens,
+        "gpu_energy_joules_per_100_accepted_tokens": energy_per_100_accepted_tokens,
+        "energy_measurement_duration_seconds": energy_duration,
+        "average_gpu_power_watts": safe_div(energy, energy_duration),
+        "average_active_compute_gpu_power_watts": safe_div(energy, energy_duration),
+        "mean_nav_gpu_energy_joules": (
+            statistics.fmean(nav_energy_values) if nav_energy_values else None
+        ),
+        "nav_gpu_energy_p95_joules": percentile(nav_energy_values, 0.95),
+        "nav_energy_measurement_count": len(nav_energy_values),
+        "energy_scope": summary.get(
+            "energy_scope", "cloud_gpu_prompt_prefill_plus_nav_compute"
+        ),
+        "energy_source": summary.get("energy_source", "nvml_gpu_board_power"),
         "num_verifications": nav_count,
-        "nav_per_100_tokens": 100 * safe_div(nav_count, tokens) if tokens else None,
-        "tokens_per_nav": safe_div(tokens, nav_count),
+        "nav_per_100_tokens": (
+            100 * safe_div(nav_count, accepted_tokens) if accepted_tokens else None
+        ),
+        "nav_per_100_accepted_tokens": (
+            100 * safe_div(nav_count, accepted_tokens) if accepted_tokens else None
+        ),
+        "tokens_per_nav": safe_div(accepted_tokens, nav_count),
         "mean_draft_length": summary.get("mean_draft_length"),
         "acceptance_rate": summary.get("acceptance_rate"),
         "spec_tokens": spec_tokens,
@@ -251,8 +334,11 @@ def normalize_result(dataset, method, path, payload, candidate_count):
         row["downlink_bytes"] / 1024 if row["downlink_bytes"] is not None else None
     )
     row["uplink_mib_per_100_tokens"] = (
-        row["uplink_mib"] * 100 / tokens if row["uplink_mib"] is not None and tokens else None
+        row["uplink_mib"] * 100 / accepted_tokens
+        if row["uplink_mib"] is not None and accepted_tokens
+        else None
     )
+    row["uplink_mib_per_100_accepted_tokens"] = row["uplink_mib_per_100_tokens"]
     return row
 
 
@@ -285,8 +371,8 @@ def comparability_warnings(rows, missing):
     warnings = []
     if missing:
         warnings.append("Missing methods: " + ", ".join(missing) + ".")
-    if len({row.get("actual_tokens") for row in rows}) > 1:
-        warnings.append("Actual output-token budgets differ across methods.")
+    if len({row.get("actual_accepted_tokens") for row in rows}) > 1:
+        warnings.append("Actual cloud-accepted draft-token budgets differ across methods.")
     if len({tuple(row.get("sample_indices") or []) for row in rows}) > 1:
         warnings.append("Sample-index sets differ; the comparison is not fully paired.")
     if len({row.get("seed") for row in rows}) > 1:
@@ -301,8 +387,16 @@ def comparability_warnings(rows, missing):
         warnings.append("At least one method has only one matching run; no cross-run confidence interval is available.")
     if any(row["method"] == "pipesd" and not row.get("bo_config_path") for row in rows):
         warnings.append("The selected PipeSD run does not record a BO configuration path.")
+    if any(row.get("zero_accepted_sample_count", 0) for row in rows):
+        warnings.append(
+            "At least one sample accepted zero draft tokens; such samples remain in total "
+            "time and energy but are excluded from per-sample accepted-token TPT dispersion."
+        )
     warnings.append(
-        "Energy covers the cloud GPU only; edge CPU, memory, network devices, and idle system power are excluded."
+        "Energy follows the original-repository active-compute scope: cloud prompt "
+        "prefill plus each target-model NAV. GPU idle between NAVs, edge-draft wait, "
+        "network transfer, proactive wait/transfer, model load, and state restore/save "
+        "are excluded."
     )
     return warnings
 
@@ -354,19 +448,20 @@ def build_markdown(report):
     sections = [
         f"# Table 1 Scenario 1 summary: {report['dataset']}",
         "",
-        "> Lower is better for TPT, latency, energy, NAV, rollback, traffic, and queue time. Energy covers the cloud GPU only.",
+        "> TPT, throughput, GPU J/100, NAV/100, and MiB/100 are normalized by cloud-accepted draft tokens. Token-latency percentiles and TTFT describe committed output tokens. Energy includes cloud prompt prefill and target-model NAV compute only.",
         "",
         "## Conclusions",
         "",
         f"- Best TPT: **{best_tpt}**.",
-        f"- Lowest recorded GPU energy per 100 tokens: **{best_energy}**.",
+        f"- Lowest recorded GPU energy per 100 accepted draft tokens: **{best_energy}**.",
         f"- PipeSD speedup over the best baseline: **{fmt(conclusions['pipesd_speedup_over_best_baseline'])}x**.",
         "",
         "## Performance, latency, and energy",
         "",
         markdown_table(
-            ["Method", "TPT ms↓", "tok/s↑", "vs Vanilla↑", "GPU J/100↓", "Energy Δ", "P50↓", "P95↓", "P99↓", "TTFT↓", "Sample CV↓"],
-            [[row["display_name"], fmt(row["tpt_ms"]), fmt(row["throughput_tokens_per_second"]),
+            ["Method", "Accepted", "Output", "TPT ms/accepted↓", "accepted tok/s↑", "vs Vanilla↑", "GPU J/100 accepted↓", "Energy Δ", "Output P50↓", "Output P95↓", "Output P99↓", "Output TTFT↓", "Sample accepted-TPT CV↓"],
+            [[row["display_name"], row["actual_accepted_tokens"], row["actual_output_tokens"],
+              fmt(row["tpt_ms"]), fmt(row["throughput_tokens_per_second"]),
               fmt(row["speedup_vs_vanilla"]), fmt(row["gpu_energy_joules_per_100_tokens"]),
               fmt(row["energy_change_vs_vanilla"], percent=True), fmt(row["token_latency_p50_ms"]),
               fmt(row["token_latency_p95_ms"]), fmt(row["token_latency_p99_ms"]),
@@ -377,7 +472,7 @@ def build_markdown(report):
         "## Speculative-decoding behavior",
         "",
         markdown_table(
-            ["Method", "Draft", "Accept↑", "NAV/100↓", "Accepted/NAV↑", "Rollback↓", "Batch", "Reuse", "Discard", "Discard rate↓"],
+            ["Method", "Draft", "Accept↑", "NAV/100 accepted↓", "Accepted/NAV↑", "Rollback↓", "Batch", "Reuse", "Discard", "Discard rate↓"],
             [[row["display_name"], fmt(row["mean_draft_length"]),
               fmt(row["acceptance_rate"], percent=True), fmt(row["nav_per_100_tokens"]),
               fmt(row["accepted_spec_tokens_per_nav"]), fmt(row["rollback_rate"], percent=True),
@@ -389,7 +484,7 @@ def build_markdown(report):
         "## Network behavior",
         "",
         markdown_table(
-            ["Method", "Upload MiB↓", "MiB/100↓", "Uploads↓", "Download KiB↓", "Queue s↓", "Service s↓", "Primary req", "Proactive req"],
+            ["Method", "Upload MiB↓", "MiB/100 accepted↓", "Uploads↓", "Download KiB↓", "Queue s↓", "Service s↓", "Primary req", "Proactive req"],
             [[row["display_name"], fmt(row["uplink_mib"]), fmt(row["uplink_mib_per_100_tokens"]),
               fmt(row["uplink_transfers"]), fmt(row["downlink_kib"]),
               fmt(row["network_queue_wait_seconds"]), fmt(row["network_service_seconds"]),
@@ -400,9 +495,12 @@ def build_markdown(report):
         "## Runtime termination",
         "",
         markdown_table(
-            ["Method", "Cap hit", "EOS", "Total s", "Avg GPU W"],
+            ["Method", "Cap hit", "EOS", "Total s", "Active GPU s", "Prefill J", "NAV J", "NAV mean J", "NAV P95 J", "Active GPU W"],
             [[row["display_name"], fmt(row["cap_hit_rate"], percent=True), row["eos_count"],
-              fmt(row["total_time_seconds"]), fmt(row["average_gpu_power_watts"])]
+              fmt(row["total_time_seconds"]), fmt(row["energy_measurement_duration_seconds"]),
+              fmt(row["prompt_prefill_gpu_energy_joules"]), fmt(row["nav_gpu_energy_joules"]),
+              fmt(row["mean_nav_gpu_energy_joules"]), fmt(row["nav_gpu_energy_p95_joules"]),
+              fmt(row["average_gpu_power_watts"])]
              for row in rows],
         ),
     ]

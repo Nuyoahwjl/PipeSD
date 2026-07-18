@@ -141,10 +141,10 @@ case "$PHASE" in
     ;;
   compare)
     compare_cmd=( "$PYTHON_BIN" scripts/compare_four_modes.py
-      exp/exp__wjl__four__modes
+      exp/exp__wjl
       --dataset "$DATASET"
-      --result-tag "$RESULT_TAG"
-      --output-dir "exp/exp__wjl__four__modes/$DATASET/comparison"
+      # --result-tag "$RESULT_TAG"
+      --output-dir "exp/exp__wjl/$DATASET/comparison"
     )
     run_cmd compare_cmd
     ;;

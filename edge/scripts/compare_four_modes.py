@@ -15,8 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 METHODS = ("pure_cloud", "pure_edge", "vanilla", "pipesd")
 DISPLAY_NAMES = {
-    "pure_cloud": "Pure Cloud (model-only)",
-    "pure_edge": "Pure Edge (local-only)",
+    "pure_cloud": "Pure Cloud ",
+    "pure_edge": "Pure Edge ",
     "vanilla": "Serial Edge-Cloud SD",
     "pipesd": "PipeSD",
 }
@@ -171,7 +171,30 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     manifest = payload["manifest"]
     summary = payload.get("summary", {})
     samples = payload.get("samples", [])
-    tokens = int(summary.get("actual_output_tokens", 0) or 0)
+    method = str(manifest["algorithm"])
+    collaborative = method in {"vanilla", "pipesd"}
+    output_tokens = int(summary.get("actual_output_tokens", 0) or 0)
+    accepted_value = (
+        summary.get("actual_accepted_draft_tokens") if collaborative else None
+    )
+    if collaborative and accepted_value is None:
+        samples_with_acceptance = [
+            sample for sample in samples if "verify_accept_lengths" in sample
+        ]
+        if samples_with_acceptance:
+            accepted_value = sum(
+                sum(int(value) for value in (sample.get("verify_accept_lengths") or []))
+                for sample in samples_with_acceptance
+            )
+    accepted_tokens = (
+        int(accepted_value) if accepted_value is not None else None
+    )
+    tokens = int(accepted_tokens or 0) if collaborative else output_tokens
+    normalization_token_type = (
+        "cloud_accepted_draft_tokens"
+        if collaborative
+        else "committed_output_tokens"
+    )
     total_time = float(summary.get("total_time_seconds", 0.0) or 0.0)
     durations = [
         float(value)
@@ -184,17 +207,26 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         if sample.get("time_to_first_token_seconds") is not None
     ]
     energy = summary.get("model_energy_joules")
-    energy_per_100 = summary.get("model_energy_joules_per_100_tokens")
     if energy is None:
         energy = summary.get("gpu_energy_joules")
-    if energy_per_100 is None:
-        energy_per_100 = summary.get("gpu_energy_joules_per_100_tokens")
-    average_power_watts = (
-        float(energy) / total_time
-        if energy is not None and total_time > 0.0
+    if method == "pure_edge":
+        # Pure Edge energy is deliberately out of scope because the evaluation
+        # host does not expose RAPL. Ignore even legacy artifacts that contain
+        # partial or privileged measurements.
+        energy = None
+    energy_per_100 = (
+        100.0 * float(energy) / tokens
+        if energy is not None and tokens
         else None
     )
-    method = str(manifest["algorithm"])
+    power_time_seconds = float(
+        summary.get("energy_measurement_duration_seconds") or total_time
+    )
+    average_power_watts = (
+        float(energy) / power_time_seconds
+        if energy is not None and power_time_seconds > 0.0
+        else None
+    )
     network = aggregate_network(samples)
     network_emulation = manifest.get("network_emulation") or {}
     row = {
@@ -209,15 +241,19 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         "network_emulator_version": network_emulation.get("emulator_version"),
         "uplink_bandwidth_MBps": manifest.get("uplink_bandwidth_MBps"),
         "downlink_bandwidth_MBps": manifest.get("downlink_bandwidth_MBps"),
-        "target_tokens": summary.get("target_output_tokens"),
+        "target_tokens": (
+            summary.get("target_accepted_draft_tokens", summary.get("target_output_tokens"))
+            if collaborative
+            else summary.get("target_output_tokens")
+        ),
         "actual_tokens": tokens,
+        "actual_accepted_tokens": accepted_tokens,
+        "actual_output_tokens": output_tokens,
+        "tpt_normalization_token_type": normalization_token_type,
         "num_samples": summary.get("num_samples", len(samples)),
         "total_time_seconds": total_time,
-        "tpt_ms": summary.get("weighted_tpt_ms"),
-        "throughput_tokens_per_second": (
-            summary.get("throughput_tokens_per_second")
-            or (tokens / total_time if total_time else None)
-        ),
+        "tpt_ms": 1000.0 * total_time / tokens if tokens else None,
+        "throughput_tokens_per_second": tokens / total_time if total_time else None,
         "token_latency_p50_ms": 1000.0 * (
             summary.get("token_latency_p50_seconds")
             if summary.get("token_latency_p50_seconds") is not None
@@ -241,18 +277,34 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         "energy_joules": energy,
         "energy_joules_per_100_tokens": energy_per_100,
         "average_power_watts": average_power_watts,
-        "power_time_seconds": total_time if average_power_watts is not None else None,
+        "power_time_seconds": power_time_seconds if average_power_watts is not None else None,
         "power_calculation": (
-            "energy_joules / total_time_seconds"
+            (
+                "energy_joules / energy_measurement_duration_seconds"
+                if summary.get("energy_measurement_duration_seconds") is not None
+                else "energy_joules / total_time_seconds"
+            )
             if average_power_watts is not None
             else None
         ),
-        "energy_scope": summary.get("energy_scope", "cloud_gpu" if method != "pure_edge" else "edge_cpu_package"),
-        "energy_source": summary.get("energy_source", "cloud_service_nvml" if energy is not None else "unavailable"),
+        "energy_scope": (
+            "not_measured_no_rapl_permission"
+            if method == "pure_edge"
+            else summary.get("energy_scope", "cloud_gpu")
+        ),
+        "energy_source": (
+            "not_measured"
+            if method == "pure_edge"
+            else summary.get(
+                "energy_source",
+                "cloud_service_nvml" if energy is not None else "unavailable",
+            )
+        ),
+        "energy_normalization_token_type": normalization_token_type,
         "verification_frequency": summary.get("verification_frequency"),
         "nav_per_100_tokens": (
-            100.0 * summary["verification_frequency"]
-            if summary.get("verification_frequency") is not None
+            100.0 * int(summary.get("num_verifications", 0) or 0) / tokens
+            if collaborative and tokens
             else None
         ),
         "mean_draft_length": summary.get("mean_draft_length"),
@@ -350,11 +402,11 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
             row["display_name"],
             fmt(
                 row["energy_joules_per_100_tokens"],
-                none_label="N/A" if row["method"] == "pure_edge" else "missing",
+                none_label="--" if row["method"] == "pure_edge" else "missing",
             ),
             fmt(
                 row["average_power_watts"],
-                none_label="N/A" if row["method"] == "pure_edge" else "missing",
+                none_label="--" if row["method"] == "pure_edge" else "missing",
             ),
             row["energy_scope"],
             fmt_for_method(row, row["nav_per_100_tokens"], applies_to="collaborative"),
@@ -401,6 +453,8 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
             str(row["git_commit"] or "N/A")[:12],
             row["seed"],
             row["actual_tokens"],
+            row["actual_output_tokens"],
+            row["tpt_normalization_token_type"],
             row["network_shaping_mode"] or "local",
             row["network_emulator_version"] or "—",
             fmt_for_method(row, row["uplink_bandwidth_MBps"], applies_to="network"),
@@ -411,44 +465,45 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
     text = [
         f"# Four-mode comparison: {dataset}",
         "",
-        "> `—` means not applicable; `missing` means the metric should exist but was not recorded; `N/A` is retained only for unavailable Pure Edge energy.",
+        "> `—` means not applicable; `missing` means the metric should exist but was not recorded; `--` means Pure Edge energy is intentionally not measured because RAPL access is unavailable.",
         "",
         "## Selected artifacts and protocol",
         "",
         markdown_table(
-            ["Method", "Run ID", "Commit", "Seed", "Tokens", "Network", "Emulator", "Up MB/s", "Down MB/s"],
+            ["Method", "Run ID", "Commit", "Seed", "Norm tokens", "Output", "TPT token type", "Network", "Emulator", "Up MB/s", "Down MB/s"],
             provenance,
         ),
         "",
         "## Latency and throughput",
         "",
         (
-            "> Every selected run contains exactly 1,000 output tokens, so TPT in "
-            "ms/token is numerically equal to total measured time in seconds: "
+            "> Every selected run contains exactly 1,000 benchmark-normalization tokens, "
+            "so TPT in ms/token is numerically equal to total measured time in seconds: "
             "TPT = total_time_seconds × 1000 / 1000. The report retains both "
-            "columns and the general token-normalized definition."
+            "columns. Collaborative modes use cloud-accepted draft tokens; pure modes "
+            "use committed output tokens because they have no NAV acceptance stage."
             if rows and all(row.get("actual_tokens") == 1000 for row in rows)
-            else "> TPT is token-normalized: TPT(ms/token) = total_time_seconds × 1000 / actual_tokens."
+            else "> TPT(ms/token) = total_time_seconds × 1000 / normalization_tokens. Collaborative modes use cloud-accepted draft tokens; pure modes use committed output tokens."
         ),
         "",
         markdown_table(
-            ["Method", "TPT ms↓", "token/s↑", "vs Serial↑", "Total s↓", "P50 ms↓", "P95 ms↓", "P99 ms↓", "TTFT ms↓"],
+            ["Method", "TPT ms/benchmark token↓", "benchmark token/s↑", "vs Serial↑", "Total s↓", "P50 ms↓", "P95 ms↓", "P99 ms↓", "TTFT ms↓"],
             common,
         ),
         "",
         "## Energy and speculative-decoding behavior",
         "",
-        "> Average power is derived as measured energy divided by reported total time. The result artifacts do not store a separate NVML sampling-window duration.",
+        "> Energy is normalized by the same benchmark-token denominator as TPT. Pure Cloud energy covers prompt prefill plus the complete autoregressive decode. Average power uses the recorded energy-window duration when available; legacy artifacts fall back to reported total time.",
         "",
         markdown_table(
-            ["Method", "Measured energy J/100↓", "Avg power W↓", "Energy scope", "NAV/100↓", "Draft len", "Accept↑", "Rollback↓", "Batch size"],
+            ["Method", "Measured energy J/100 benchmark tokens↓", "Avg power W↓", "Energy scope", "NAV/100↓", "Draft len", "Accept↑", "Rollback↓", "Batch size"],
             efficiency,
         ),
         "",
         "## Network behavior",
         "",
         markdown_table(
-            ["Method", "Upload MiB↓", "MiB/100 tok↓", "Uploads↓", "Avg upload KiB", "Download MiB↓", "Queue s↓", "Service s↓"],
+            ["Method", "Upload MiB↓", "MiB/100 benchmark tokens↓", "Uploads↓", "Avg upload KiB", "Download MiB↓", "Queue s↓", "Service s↓"],
             network_rows,
         ),
         "",
@@ -467,14 +522,16 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
 def comparability_warnings(rows: Sequence[Dict[str, Any]]) -> List[str]:
     warnings = []
     if len({row.get("actual_tokens") for row in rows}) > 1:
-        warnings.append("Actual accepted-token budgets differ across methods.")
+        warnings.append("Actual benchmark-normalization token counts differ across methods.")
     if len({row.get("seed") for row in rows}) > 1:
         warnings.append("Seeds differ across methods.")
     if len({row.get("result_tag") for row in rows}) > 1:
         warnings.append("Result tags differ; confirm that all runs belong to the same scenario.")
     if any(row["method"] == "pure_cloud" for row in rows):
         warnings.append(
-            "Pure Cloud (model-only) reports local target-model decode time and excludes client-cloud transfer; collaborative modes include emulated transport."
+            "Pure Cloud (model-only) TPT covers the warm-model local request end to end "
+            "and excludes model load and client-cloud transfer; its energy covers prompt "
+            "prefill plus complete decode. Collaborative modes include emulated transport."
         )
     collaborative = [row for row in rows if row["method"] in {"vanilla", "pipesd"}]
     if any(row.get("mean_ttft_ms") is None for row in collaborative):
@@ -486,7 +543,9 @@ def comparability_warnings(rows: Sequence[Dict[str, Any]]) -> List[str]:
         and row.get("energy_joules_per_100_tokens") is None
         for row in rows
     ):
-        warnings.append("At least one non-Pure-Edge run is missing its expected energy measurement.")
+        warnings.append(
+            "At least one energy-enabled run is missing its expected measurement."
+        )
     network_configs = {
         (
             row.get("network_shaping_mode"),
@@ -507,6 +566,16 @@ def comparability_warnings(rows: Sequence[Dict[str, Any]]) -> List[str]:
     scopes = {row.get("energy_scope") for row in rows if row.get("energy_joules_per_100_tokens") is not None}
     if len(scopes) > 1:
         warnings.append("Energy values use different hardware scopes; do not rank them as whole-system energy.")
+    energy_units = {
+        row.get("energy_normalization_token_type")
+        for row in rows
+        if row.get("energy_joules_per_100_tokens") is not None
+    }
+    if len(energy_units) > 1:
+        warnings.append(
+            "Energy-per-100 values use different token denominators (accepted draft "
+            "tokens versus committed output tokens) and are not directly comparable."
+        )
     return warnings
 
 
@@ -516,7 +585,7 @@ def resolve_output_dir(
     if explicit is not None:
         return explicit
     return (
-        Path("exp/exp__wjl__four__modes")
+        Path("exp/exp__wjl")
         / dataset
         / "comparison"
         / (result_tag_value or "latest")
@@ -540,7 +609,7 @@ def main():
         default=None,
         help=(
             "Output directory. By default reports are written beside the "
-            "dataset results under exp/exp__wjl__four__modes/<dataset>/comparison."
+            "dataset results under exp/exp__wjl/<dataset>/comparison."
         ),
     )
     parser.add_argument(
