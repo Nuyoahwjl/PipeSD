@@ -164,6 +164,11 @@ class InferenceTask:
         except Exception:
             self.torch_generator = None
         self.total_gpu_power_integral_joules = 0.0
+        self.prompt_prefill_gpu_energy_joules = 0.0
+        self.nav_gpu_energy_joules = 0.0
+        self.energy_measurement_duration_seconds = 0.0
+        self.prompt_prefill_energy_measurement = None
+        self.nav_energy_trace = []
         self.last_verify_power_integral = 0.0
         self.veridy_num = 0
         self.cache_version = 0
@@ -191,23 +196,54 @@ class InferenceTask:
         consistency = True
 
     def _energy_context(self, stage: str):
-        if self.task_energy_tracker is not None:
-            return nullcontext()
         if not gpu_energy_monitor or not gpu_energy_monitor.enabled:
             return nullcontext()
         return EnergyTracker(gpu_energy_monitor, self, stage, POWER_SAMPLE_INTERVAL, logger=logger)
 
     def start_energy_tracking(self):
-        if gpu_energy_monitor and gpu_energy_monitor.enabled and self.task_energy_tracker is None:
-            self.task_energy_tracker = EnergyTracker(
-                gpu_energy_monitor, self, "task_total", POWER_SAMPLE_INTERVAL, logger=logger
-            )
-            self.task_energy_tracker.__enter__()
+        """Retained for edge-client compatibility; active stages track themselves."""
+        self.task_energy_tracker = None
 
     def stop_energy_tracking(self):
-        tracker, self.task_energy_tracker = self.task_energy_tracker, None
-        if tracker is not None:
-            tracker.__exit__(None, None, None)
+        self.task_energy_tracker = None
+
+    def record_energy_measurement(
+        self,
+        *,
+        stage: str,
+        energy_joules: float,
+        duration_seconds: float,
+        sample_count: int,
+    ):
+        measurement = {
+            'stage': stage,
+            'energy_joules': float(energy_joules),
+            'duration_seconds': float(duration_seconds),
+            'sample_count': int(sample_count),
+        }
+        self.total_gpu_power_integral_joules += float(energy_joules)
+        self.energy_measurement_duration_seconds += float(duration_seconds)
+        if stage == 'init_eval':
+            self.prompt_prefill_gpu_energy_joules += float(energy_joules)
+            self.prompt_prefill_energy_measurement = measurement
+        elif stage == 'verify_total':
+            self.nav_gpu_energy_joules += float(energy_joules)
+            self.last_verify_power_integral = float(energy_joules)
+            measurement['nav_index'] = len(self.nav_energy_trace)
+            self.nav_energy_trace.append(measurement)
+        return measurement
+
+    def annotate_last_nav_energy(self, *, round_id, n_past, result):
+        if not self.nav_energy_trace:
+            return None
+        measurement = self.nav_energy_trace[-1]
+        measurement.update({
+            'speculative_round_id': round_id,
+            'n_past': int(n_past),
+            'n_speculative': int(result.get('n_speculative', 0) or 0),
+            'n_accepted': int(result.get('n_accepted', 0) or 0),
+        })
+        return dict(measurement)
         
     def load_model(self):
         self.target_model = Llama(
@@ -225,7 +261,8 @@ class InferenceTask:
     def proc_prefix(self):
         shared_model.set_task(self.task_id)
         self.target_model.reset()
-        self.target_model.eval(self.prefix)
+        with self._energy_context("init_eval"):
+            self.target_model.eval(self.prefix)
         self.n_past = self.target_model.n_tokens
         self.save_model_state()
         return self.n_past == len(self.prefix)
@@ -519,7 +556,11 @@ def handle_start_request(request: TaskRequest):
         raise HTTPException(status_code=400, detail="Task not found or not initialized.")
     with task.lock:
         task.start_energy_tracking()
-    return {'status': 'started', 'task_id': request.task_id}
+    return {
+        'status': 'started',
+        'task_id': request.task_id,
+        'energy_scope': 'cloud_gpu_prompt_prefill_plus_nav_compute',
+    }
 
 def handle_propose_payload(payload):
     task_id = payload.get('task_id')
@@ -655,10 +696,23 @@ def handle_propose_payload(payload):
     # populate task.proactive_buffers while target-model verification runs.
     try:
         with model_lock:
+            nav_measurement_count_before = len(task.nav_energy_trace)
             task.restore_model_state()
             result = task.verify_tokens(n_past_at_receive)
             task.save_model_state()
             task.veridy_num += 1
+            nav_energy = (
+                task.annotate_last_nav_energy(
+                    round_id=active_round_id,
+                    n_past=n_past_at_receive,
+                    result=result,
+                )
+                if len(task.nav_energy_trace) > nav_measurement_count_before
+                else None
+            )
+            if nav_energy is not None:
+                result['gpu_power_integral'] = nav_energy['energy_joules']
+                result['nav_energy_measurement'] = nav_energy
     finally:
         with task.verify_condition:
             if 'result' in locals():
@@ -703,13 +757,66 @@ def handle_exit_payload(payload):
             task = active_tasks.pop(task_id, None) if task_id is not None else None
         if task is not None:
             task.stop_energy_tracking()
-            power_int = task.total_gpu_power_integral_joules
+            energy_available = bool(
+                gpu_energy_monitor and gpu_energy_monitor.enabled
+            )
+            power_int = (
+                task.total_gpu_power_integral_joules
+                if energy_available
+                else None
+            )
             response['gpu_power_integral_joules'] = power_int
+            response['model_energy_joules'] = power_int
+            response['prompt_prefill_gpu_energy_joules'] = (
+                task.prompt_prefill_gpu_energy_joules
+                if energy_available
+                else None
+            )
+            response['nav_gpu_energy_joules'] = (
+                task.nav_gpu_energy_joules
+                if energy_available
+                else None
+            )
+            response['prompt_prefill_energy_measurement'] = (
+                dict(task.prompt_prefill_energy_measurement)
+                if task.prompt_prefill_energy_measurement is not None
+                else None
+            )
+            response['nav_energy_trace'] = [
+                dict(measurement) for measurement in task.nav_energy_trace
+            ]
+            response['energy_measurement_duration_seconds'] = (
+                task.energy_measurement_duration_seconds
+                if energy_available
+                else None
+            )
+            response['energy_measurement_available'] = energy_available
+            response['energy_scope'] = 'cloud_gpu_prompt_prefill_plus_nav_compute'
+            response['energy_source'] = 'nvml_gpu_board_power'
+            response['energy_sample_interval_seconds'] = POWER_SAMPLE_INTERVAL
+            response['energy_included_stages'] = [
+                'cloud_prompt_prefill',
+                'target_model_nav_compute',
+            ]
+            response['energy_excluded_stages'] = [
+                'between_nav_gpu_idle',
+                'edge_draft_wait',
+                'network_transfer',
+                'proactive_wait_and_transfer',
+                'model_load',
+                'model_state_restore_and_save',
+            ]
             response['verify_num'] = task.veridy_num
             response['cache_version'] = task.cache_version
             response['discarded_proactive_tokens'] = task.discarded_proactive_tokens
             response['reused_proactive_tokens'] = task.reused_proactive_tokens
-            logger.info("task=%s gpu_power_integral_total=%.6fJ (final)", task_id, power_int)
+            logger.info(
+                "task=%s active_compute_gpu_energy=%sJ prefill=%.6fJ nav=%.6fJ (final)",
+                task_id,
+                f"{power_int:.6f}" if power_int is not None else "unavailable",
+                task.prompt_prefill_gpu_energy_joules,
+                task.nav_gpu_energy_joules,
+            )
 
     return response
 

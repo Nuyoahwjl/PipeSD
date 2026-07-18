@@ -178,6 +178,101 @@ def load_module():
 
 
 class CloudServerTaskStateTests(unittest.TestCase):
+    def test_proc_prefix_measures_only_target_model_eval(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.gpu_energy_monitor.enabled = True
+        stages = []
+
+        class RecordingEnergyContext:
+            def __init__(self, _monitor, task, stage, _interval, logger=None):
+                self.task = task
+                self.stage = stage
+
+            def __enter__(self):
+                stages.append(("enter", self.stage))
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.task.record_energy_measurement(
+                    stage=self.stage,
+                    energy_joules=5.0,
+                    duration_seconds=0.05,
+                    sample_count=3,
+                )
+                stages.append(("exit", self.stage))
+                return False
+
+        module.EnergyTracker = RecordingEnergyContext
+        task = module.InferenceTask(task_id=1, prefix=[11, 12, 13], args=args)
+
+        task.proc_prefix()
+
+        self.assertEqual(stages, [("enter", "init_eval"), ("exit", "init_eval")])
+        self.assertEqual(task.prompt_prefill_gpu_energy_joules, 5.0)
+        self.assertEqual(task.nav_gpu_energy_joules, 0.0)
+
+    def test_energy_accounting_separates_prefill_and_each_nav(self):
+        module = load_module()
+        args = module.parse_arguments()
+        task = module.InferenceTask(task_id=1, prefix=[1, 2], args=args)
+
+        task.record_energy_measurement(
+            stage="init_eval", energy_joules=10.0,
+            duration_seconds=0.1, sample_count=5,
+        )
+        task.record_energy_measurement(
+            stage="verify_total", energy_joules=3.0,
+            duration_seconds=0.02, sample_count=3,
+        )
+        measurement = task.annotate_last_nav_energy(
+            round_id=7,
+            n_past=20,
+            result={"n_speculative": 4, "n_accepted": 3},
+        )
+
+        self.assertEqual(task.total_gpu_power_integral_joules, 13.0)
+        self.assertEqual(task.prompt_prefill_gpu_energy_joules, 10.0)
+        self.assertEqual(task.nav_gpu_energy_joules, 3.0)
+        self.assertAlmostEqual(task.energy_measurement_duration_seconds, 0.12)
+        self.assertEqual(len(task.nav_energy_trace), 1)
+        self.assertEqual(measurement["speculative_round_id"], 7)
+        self.assertEqual(measurement["n_speculative"], 4)
+        self.assertEqual(measurement["n_accepted"], 3)
+
+    def test_exit_returns_active_compute_breakdown_and_nav_trace(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        module.gpu_energy_monitor.enabled = True
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task.record_energy_measurement(
+            stage="init_eval", energy_joules=5.0,
+            duration_seconds=0.05, sample_count=3,
+        )
+        task.record_energy_measurement(
+            stage="verify_total", energy_joules=2.0,
+            duration_seconds=0.01, sample_count=2,
+        )
+        task.annotate_last_nav_energy(
+            round_id=0,
+            n_past=1,
+            result={"n_speculative": 2, "n_accepted": 1},
+        )
+        module.active_tasks[1] = task
+
+        result = module.handle_exit_payload({"type": "exit", "task_id": 1})
+
+        self.assertEqual(result["model_energy_joules"], 7.0)
+        self.assertEqual(result["prompt_prefill_gpu_energy_joules"], 5.0)
+        self.assertEqual(result["nav_gpu_energy_joules"], 2.0)
+        self.assertEqual(len(result["nav_energy_trace"]), 1)
+        self.assertEqual(
+            result["energy_scope"],
+            "cloud_gpu_prompt_prefill_plus_nav_compute",
+        )
+        self.assertIn("network_transfer", result["energy_excluded_stages"])
+
     def test_proc_prefix_snapshots_task_state(self):
         module = load_module()
         args = module.parse_arguments()

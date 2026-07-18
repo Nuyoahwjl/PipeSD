@@ -176,10 +176,12 @@ class EnergyTracker:
         self._samples: List[Tuple[float, float]] = []
         self._stop_event: Optional[threading.Event] = None
         self._sampler_thread: Optional[threading.Thread] = None
+        self._started_at: Optional[float] = None
         self.logger = logger or logging.getLogger(__name__)
 
     def __enter__(self):
         if self.monitor.supports_power:
+            self._started_at = time.perf_counter()
             self._stop_event = threading.Event()
             self._samples = []
 
@@ -201,12 +203,13 @@ class EnergyTracker:
 
     def __exit__(self, exc_type, exc, tb):
         if self._stop_event is not None:
-            final_power = self.monitor.read_power_watts()
-            if final_power is not None:
-                self._samples.append((time.perf_counter(), final_power))
             self._stop_event.set()
             if self._sampler_thread is not None:
                 self._sampler_thread.join()
+            final_power = self.monitor.read_power_watts()
+            if final_power is not None:
+                self._samples.append((time.perf_counter(), final_power))
+        finished_at = time.perf_counter()
 
         power_integral = 0.0
         if len(self._samples) >= 2:
@@ -215,6 +218,21 @@ class EnergyTracker:
                 if dt <= 0:
                     continue
                 power_integral += (p0 + p1) * 0.5 * dt
+        duration_seconds = (
+            max(0.0, finished_at - self._started_at)
+            if self._started_at is not None
+            else 0.0
+        )
+        if hasattr(self.task, "record_energy_measurement"):
+            self.task.record_energy_measurement(
+                stage=self.stage,
+                energy_joules=power_integral,
+                duration_seconds=duration_seconds,
+                sample_count=len(self._samples),
+            )
+        elif len(self._samples) >= 2:
+            # Backward-compatible fallback for callers that predate structured
+            # prompt-prefill/NAV energy records.
             self.task.total_gpu_power_integral_joules += power_integral
 
         self.logger.info(
