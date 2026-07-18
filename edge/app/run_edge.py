@@ -429,31 +429,115 @@ class CloudEdgeSpeculativeEval(Decoding):
             if int(batch.get("actual_batch_size", 0)) > 0
         ]
         measured_energy = [
-            float(item["gpu_power_integral_joules"])
+            float(
+                item.get("model_energy_joules")
+                if item.get("model_energy_joules") is not None
+                else item["gpu_power_integral_joules"]
+            )
             for item in sample_results
-            if item.get("gpu_power_integral_joules") is not None
+            if (
+                item.get("model_energy_joules") is not None
+                or item.get("gpu_power_integral_joules") is not None
+            )
+        ]
+        measured_prefill_energy = [
+            float(item["prompt_prefill_gpu_energy_joules"])
+            for item in sample_results
+            if item.get("prompt_prefill_gpu_energy_joules") is not None
+        ]
+        measured_nav_energy = [
+            float(item["nav_gpu_energy_joules"])
+            for item in sample_results
+            if item.get("nav_gpu_energy_joules") is not None
+        ]
+        measured_energy_durations = [
+            float(item["energy_measurement_duration_seconds"])
+            for item in sample_results
+            if item.get("energy_measurement_duration_seconds") is not None
         ]
         total_energy = (
             sum(measured_energy)
             if len(measured_energy) == len(sample_results)
             else None
         )
+        total_prefill_energy = (
+            sum(measured_prefill_energy)
+            if len(measured_prefill_energy) == len(sample_results)
+            else None
+        )
+        total_nav_energy = (
+            sum(measured_nav_energy)
+            if len(measured_nav_energy) == len(sample_results)
+            else None
+        )
+        total_energy_duration = (
+            sum(measured_energy_durations)
+            if len(measured_energy_durations) == len(sample_results)
+            else None
+        )
+        energy_scopes = {
+            item.get("energy_scope") for item in sample_results if item.get("energy_scope")
+        }
+        energy_sources = {
+            item.get("energy_source") for item in sample_results if item.get("energy_source")
+        }
         return {
             "evaluation_protocol": self.args.evaluation_protocol,
+            # Keep target_output_tokens for command/result compatibility.  Under
+            # paper_table1 it is now the requested cloud-accepted draft-token
+            # count; actual_output_tokens still describes committed output and
+            # therefore also includes the target model's extra token per NAV.
             "target_output_tokens": int(self.args.target_output_tokens),
+            "target_accepted_draft_tokens": int(self.args.target_output_tokens),
+            "actual_accepted_draft_tokens": accepted_drafts,
+            "stopping_criterion": "cloud_accepted_draft_tokens",
             "actual_output_tokens": actual_tokens,
             "sample_indices": [item.get("sample_index") for item in sample_results],
             "num_samples": len(sample_results),
             "total_time_seconds": total_time,
-            "weighted_tpt_seconds": total_time / actual_tokens if actual_tokens else None,
-            "weighted_tpt_ms": 1000.0 * total_time / actual_tokens if actual_tokens else None,
+            # The paper benchmark unit is a cloud-accepted draft token.  Keep
+            # explicit output-token metrics because every NAV may also commit
+            # one target-model final token.
+            "tpt_normalization_token_type": "cloud_accepted_draft_tokens",
+            "weighted_tpt_seconds": (
+                total_time / accepted_drafts if accepted_drafts else None
+            ),
+            "weighted_tpt_ms": (
+                1000.0 * total_time / accepted_drafts if accepted_drafts else None
+            ),
+            "accepted_token_tpt_seconds": (
+                total_time / accepted_drafts if accepted_drafts else None
+            ),
+            "accepted_token_tpt_ms": (
+                1000.0 * total_time / accepted_drafts if accepted_drafts else None
+            ),
+            "output_token_tpt_seconds": (
+                total_time / actual_tokens if actual_tokens else None
+            ),
+            "output_token_tpt_ms": (
+                1000.0 * total_time / actual_tokens if actual_tokens else None
+            ),
+            "throughput_tokens_per_second": (
+                accepted_drafts / total_time if total_time else None
+            ),
+            "accepted_tokens_per_second": (
+                accepted_drafts / total_time if total_time else None
+            ),
+            "output_tokens_per_second": (
+                actual_tokens / total_time if total_time else None
+            ),
             "token_latency_p50_seconds": self._percentile(durations, 0.50),
             "token_latency_p95_seconds": self._percentile(durations, 0.95),
             "token_latency_p99_seconds": self._percentile(durations, 0.99),
             "mean_ttft_seconds": statistics.fmean(ttft) if ttft else None,
             "ttft_p95_seconds": self._percentile(ttft, 0.95),
             "num_verifications": num_verifications,
-            "verification_frequency": num_verifications / actual_tokens if actual_tokens else None,
+            "verification_frequency": (
+                num_verifications / accepted_drafts if accepted_drafts else None
+            ),
+            "verification_frequency_per_output_token": (
+                num_verifications / actual_tokens if actual_tokens else None
+            ),
             "mean_draft_length": draft_tokens / num_verifications if num_verifications else None,
             "acceptance_rate": accepted_drafts / draft_tokens if draft_tokens else None,
             "rollback_rate": rollback_events / num_verifications if num_verifications else None,
@@ -464,8 +548,54 @@ class CloudEdgeSpeculativeEval(Decoding):
                 if sample_results else None
             ),
             "eos_count": sum(1 for item in sample_results if item.get("ended_with_eos")),
+            "model_energy_joules": total_energy,
             "gpu_energy_joules": total_energy,
+            "prompt_prefill_gpu_energy_joules": total_prefill_energy,
+            "nav_gpu_energy_joules": total_nav_energy,
+            "energy_measurement_duration_seconds": total_energy_duration,
+            "average_active_compute_gpu_power_watts": (
+                total_energy / total_energy_duration
+                if total_energy is not None and total_energy_duration
+                else None
+            ),
+            "nav_energy_measurement_count": sum(
+                len(item.get("nav_energy_trace", [])) for item in sample_results
+            ),
+            "energy_scope": (
+                next(iter(energy_scopes)) if len(energy_scopes) == 1 else sorted(energy_scopes)
+            ),
+            "energy_source": (
+                next(iter(energy_sources)) if len(energy_sources) == 1 else sorted(energy_sources)
+            ),
+            "energy_normalization_token_type": "cloud_accepted_draft_tokens",
+            "energy_included_stages": [
+                "cloud_prompt_prefill",
+                "target_model_nav_compute",
+            ],
+            "energy_excluded_stages": [
+                "between_nav_gpu_idle",
+                "edge_draft_wait",
+                "network_transfer",
+                "proactive_wait_and_transfer",
+                "model_load",
+                "model_state_restore_and_save",
+            ],
             "gpu_energy_joules_per_100_tokens": (
+                100.0 * total_energy / accepted_drafts
+                if total_energy is not None and accepted_drafts
+                else None
+            ),
+            "gpu_energy_joules_per_100_accepted_tokens": (
+                100.0 * total_energy / accepted_drafts
+                if total_energy is not None and accepted_drafts
+                else None
+            ),
+            "model_energy_joules_per_100_tokens": (
+                100.0 * total_energy / accepted_drafts
+                if total_energy is not None and accepted_drafts
+                else None
+            ),
+            "gpu_energy_joules_per_100_output_tokens": (
                 100.0 * total_energy / actual_tokens
                 if total_energy is not None and actual_tokens
                 else None
@@ -479,8 +609,11 @@ class CloudEdgeSpeculativeEval(Decoding):
         return legacy_path.with_name(f"{legacy_path.stem}_run={safe_run_id}.json")
 
     def _run_paper_table1(self):
-        target_tokens = int(self.args.target_output_tokens)
-        if target_tokens <= 0:
+        # Preserve the existing CLI option for compatibility, but interpret the
+        # paper_table1 target as cloud-accepted draft tokens rather than total
+        # committed output tokens.
+        target_accepted_tokens = int(self.args.target_output_tokens)
+        if target_accepted_tokens <= 0:
             raise ValueError("target_output_tokens must be positive")
         if not self.samples:
             raise RuntimeError("no dataset samples are available")
@@ -488,30 +621,44 @@ class CloudEdgeSpeculativeEval(Decoding):
         self._reset_run_duration_buffers()
         sample_results = []
         samples_iter = itertools.cycle(self.samples)
-        actual_tokens = 0
+        actual_accepted_tokens = 0
         no_progress = 0
-        while actual_tokens < target_tokens:
+        while actual_accepted_tokens < target_accepted_tokens:
             sample = next(samples_iter)
             prompt, task_id = self.preprocess(sample)
             self._reset_state()
+            remaining_accepted_tokens = target_accepted_tokens - actual_accepted_tokens
             result = self.edge_process_draft_model(
                 prompt,
                 task_id,
                 persist_result=False,
-                max_accepted_tokens=target_tokens - actual_tokens,
+                max_cloud_accepted_tokens=remaining_accepted_tokens,
             )
             if not isinstance(result, dict):
                 no_progress += 1
                 if no_progress >= len(self.samples):
                     raise RuntimeError("a complete dataset pass produced no accepted tokens")
                 continue
+
             produced = int(result.get("output_length", 0))
-            if produced <= 0:
-                no_progress += 1
-                if no_progress >= len(self.samples):
-                    raise RuntimeError("a complete dataset pass produced no accepted tokens")
-                continue
-            no_progress = 0
+            accepted = sum(
+                int(value) for value in result.get("verify_accept_lengths", [])
+            )
+            if accepted < 0:
+                raise RuntimeError("cloud returned a negative accepted-token count")
+            if accepted > remaining_accepted_tokens:
+                raise RuntimeError(
+                    "cloud accepted-token count exceeded the remaining paper_table1 "
+                    f"budget: accepted={accepted}, remaining={remaining_accepted_tokens}"
+                )
+            if accepted > produced:
+                raise RuntimeError(
+                    "cloud accepted more draft tokens than the committed output contains: "
+                    f"accepted={accepted}, output_length={produced}"
+                )
+
+            result["accepted_draft_tokens"] = accepted
+            result["cumulative_accepted_draft_tokens"] = actual_accepted_tokens + accepted
             result["sample_index"] = sample.get("sample_index", task_id)
             result["dataset_task_id"] = sample.get("task_id", task_id)
             if self.args.dataset.lower() == "gsm8k":
@@ -520,10 +667,21 @@ class CloudEdgeSpeculativeEval(Decoding):
                 result["canonical_solution"] = sample.get("canonical_solution")
                 result["entry_point"] = sample.get("entry_point")
             sample_results.append(result)
-            actual_tokens += produced
 
-        if actual_tokens != target_tokens:
-            raise RuntimeError(f"paper protocol produced {actual_tokens} tokens, expected {target_tokens}")
+            if accepted <= 0:
+                no_progress += 1
+                if no_progress >= len(self.samples):
+                    raise RuntimeError("a complete dataset pass produced no accepted tokens")
+                continue
+            no_progress = 0
+            actual_accepted_tokens += accepted
+
+        if actual_accepted_tokens != target_accepted_tokens:
+            raise RuntimeError(
+                "paper protocol reached "
+                f"{actual_accepted_tokens} cloud-accepted draft tokens, "
+                f"expected {target_accepted_tokens}"
+            )
 
         payload = {
             "manifest": self._build_manifest(),

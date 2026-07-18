@@ -163,6 +163,7 @@ class Decoding(ABC):
         self._sample_token_durations = []
         self._sample_decode_started_at = None
         self._first_accepted_token_latency = None
+        self._last_commit_included_final_token = False
         self.batch_trace = []
         self._speculative_round_id = 0
 
@@ -398,9 +399,12 @@ class Decoding(ABC):
         accepted_count = min(max(0, int(n_accepted)), len(speculative_tokens), remaining)
         committed = list(speculative_tokens[:accepted_count])
         output_tokens.extend(committed)
+        final_token_committed = False
         if len(committed) < remaining and final_token is not None:
             output_tokens.append(final_token)
             committed.append(final_token)
+            final_token_committed = True
+        self._last_commit_included_final_token = final_token_committed
         if (
             committed
             and getattr(self, '_first_accepted_token_latency', None) is None
@@ -434,6 +438,47 @@ class Decoding(ABC):
     ) -> bool:
         pending_count = len(speculative_tokens) + len(waiting_tokens or [])
         return len(output_tokens) + pending_count >= self.max_len - 1
+
+    @staticmethod
+    def _accepted_budget_remaining(
+        max_cloud_accepted_tokens: Optional[int],
+        accepted_so_far: int,
+    ) -> Optional[int]:
+        if max_cloud_accepted_tokens is None:
+            return None
+        return max(0, int(max_cloud_accepted_tokens) - int(accepted_so_far))
+
+    def _must_verify_for_accepted_budget(
+        self,
+        speculative_tokens: List[int],
+        accepted_so_far: int,
+        max_cloud_accepted_tokens: Optional[int],
+        waiting_tokens: Optional[List[int]] = None,
+    ) -> bool:
+        remaining = self._accepted_budget_remaining(
+            max_cloud_accepted_tokens, accepted_so_far
+        )
+        if remaining is None:
+            return False
+        pending_count = len(speculative_tokens) + len(waiting_tokens or [])
+        return pending_count >= remaining
+
+    @staticmethod
+    def _advance_accepted_budget(
+        accepted_so_far: int,
+        newly_accepted: int,
+        max_cloud_accepted_tokens: Optional[int],
+    ) -> int:
+        updated = int(accepted_so_far) + max(0, int(newly_accepted))
+        if (
+            max_cloud_accepted_tokens is not None
+            and updated > int(max_cloud_accepted_tokens)
+        ):
+            raise RuntimeError(
+                "cloud accepted-token budget exceeded inside one sample: "
+                f"accepted={updated}, budget={int(max_cloud_accepted_tokens)}"
+            )
+        return updated
 
     def _build_histogram(self, values: List[int]) -> Dict[str, int]:
         hist: Dict[str, int] = {}
@@ -614,6 +659,7 @@ class Decoding(ABC):
         task_id,
         persist_result: bool = True,
         max_accepted_tokens: Optional[int] = None,
+        max_cloud_accepted_tokens: Optional[int] = None,
     ):
         """
         [最终修正 & 多任务版] 边缘端工作进程。
@@ -634,8 +680,16 @@ class Decoding(ABC):
         output_tokens = self.draft_model.tokenize(prefix.encode("utf-8"), add_bos=True)
         prefix_len = len(output_tokens)
         generation_budget = self.max_generated_len
+        # max_accepted_tokens is retained as the legacy per-output cap used by
+        # BO/debug callers.  The paper protocol uses the independent cloud-
+        # accepted budget and leaves this output cap at max_generated_len (128).
         if max_accepted_tokens is not None:
             generation_budget = min(generation_budget, max(0, int(max_accepted_tokens)))
+        cloud_accepted_budget = (
+            max(0, int(max_cloud_accepted_tokens))
+            if max_cloud_accepted_tokens is not None
+            else None
+        )
         self.max_len = prefix_len + generation_budget
         self.color_print(f"[Edge] 任务 {task_id} 开始处理，prefix 长度 {len(output_tokens)}", 2)
 
@@ -685,7 +739,21 @@ class Decoding(ABC):
         self._token_time_ref = time.time()
         total_start_time = self._token_time_ref
         self._sample_decode_started_at = time.perf_counter()
-        while len(output_tokens) < self.max_len:
+        sample_cloud_accepted_tokens = 0
+        accepted_budget_is_binding = (
+            cloud_accepted_budget is not None
+            and cloud_accepted_budget <= generation_budget
+        )
+        allow_waiting_generation = (
+            self.send_while_generating and not accepted_budget_is_binding
+        )
+        while (
+            len(output_tokens) < self.max_len
+            and (
+                cloud_accepted_budget is None
+                or sample_cloud_accepted_tokens < cloud_accepted_budget
+            )
+        ):
 
             # --- 1. 生成一个token ---
             generation_step_start = time.perf_counter()
@@ -727,6 +795,11 @@ class Decoding(ABC):
             should_verify = should_verify or self._must_verify_for_budget(
                 output_tokens,
                 total_speculative_tokens,
+            )
+            should_verify = should_verify or self._must_verify_for_accepted_budget(
+                total_speculative_tokens,
+                sample_cloud_accepted_tokens,
+                cloud_accepted_budget,
             )
 
             should_end = (next_token == self.draft_model.token_eos())  # 结束条件
@@ -807,7 +880,14 @@ class Decoding(ABC):
                 nav_returned = False
                 self._speculative_round_id += 1
 
-                while self.send_while_generating and len(output_tokens) + len(total_speculative_tokens) + len(waiting_tokens) < self.max_len:
+                while (
+                    allow_waiting_generation
+                    and len(output_tokens)
+                    + len(total_speculative_tokens)
+                    + len(waiting_tokens)
+                    + (2 if not waiting_tokens else 1)
+                    <= self.max_len
+                ):
 
                     if not waiting_tokens:
                         speculative_final_step_start = time.perf_counter()
@@ -851,6 +931,15 @@ class Decoding(ABC):
                         output_tokens,
                         total_speculative_tokens,
                         waiting_tokens,
+                    )
+                    should_verify_waiting = (
+                        should_verify_waiting
+                        or self._must_verify_for_accepted_budget(
+                            total_speculative_tokens,
+                            sample_cloud_accepted_tokens,
+                            cloud_accepted_budget,
+                            waiting_tokens,
+                        )
                     )
                     should_verify_waiting = should_verify_waiting or wait_token == self.draft_model.token_eos()
 
@@ -946,6 +1035,11 @@ class Decoding(ABC):
                 # 处理验证结果
                 n_accepted = verify_result['n_accepted']
                 final_token = verify_result['final_token']
+                sample_cloud_accepted_tokens = self._advance_accepted_budget(
+                    sample_cloud_accepted_tokens,
+                    n_accepted,
+                    cloud_accepted_budget,
+                )
                 self.verify_spec_lengths.append(len(total_speculative_tokens))
                 self.verify_accept_lengths.append(n_accepted)
                 self.verify_his.append((len(total_speculative_tokens), n_accepted))
@@ -960,13 +1054,20 @@ class Decoding(ABC):
                     n_accepted,
                     final_token,
                 )
+                final_token_committed = bool(
+                    getattr(self, '_last_commit_included_final_token', False)
+                )
                 
                 last_verify_all_passed = (n_accepted == len(total_speculative_tokens) and final_token == speculated_final_token)
                 if not last_verify_all_passed:
                     self.draft_model.n_tokens = current_n_past + n_accepted
                 # print(f'当前n_tokens: {self.draft_model.n_tokens}, current_n_past: {current_n_past}, n_accepted: {n_accepted}')
-                current_n_past = current_n_past + n_accepted + 1
-                if final_token != speculated_final_token:
+                current_n_past = (
+                    current_n_past
+                    + n_accepted
+                    + (1 if final_token_committed else 0)
+                )
+                if final_token_committed and final_token != speculated_final_token:
                     self.draft_model.eval([final_token])
                     # print(f"[DEBUG] final_token 与 speculated_final_token 不同，eval final_token: {final_token}")
                 
@@ -986,7 +1087,11 @@ class Decoding(ABC):
                 
                 
                 # --- 5. 处理等待期间生成的token ---
-                if len(output_tokens) >= self.max_len:
+                accepted_budget_exhausted = (
+                    cloud_accepted_budget is not None
+                    and sample_cloud_accepted_tokens >= cloud_accepted_budget
+                )
+                if len(output_tokens) >= self.max_len or accepted_budget_exhausted:
                     for fut in waiting_futures:
                         if not fut.done():
                             self.proactive_sender.cancel_future(fut)
@@ -1013,6 +1118,11 @@ class Decoding(ABC):
                             else:
                                 n_accepted_waiting = verify_result_waiting['n_accepted']
                                 final_token_waiting = verify_result_waiting['final_token']
+                                sample_cloud_accepted_tokens = self._advance_accepted_budget(
+                                    sample_cloud_accepted_tokens,
+                                    n_accepted_waiting,
+                                    cloud_accepted_budget,
+                                )
                                 waiting_spec_len = len(waiting_tokens)
                                 self.verify_spec_lengths.append(waiting_spec_len)
                                 self.verify_accept_lengths.append(n_accepted_waiting)
@@ -1161,6 +1271,12 @@ class Decoding(ABC):
         }
         if self.num_spec_tokens_sent > self.num_spec_tokens_generated:
             raise RuntimeError("sent speculative-token count exceeds generated-token count")
+        if sample_cloud_accepted_tokens != sum(self.verify_accept_lengths):
+            raise RuntimeError(
+                "per-sample cloud accepted-token accounting mismatch: "
+                f"tracked={sample_cloud_accepted_tokens}, "
+                f"trace={sum(self.verify_accept_lengths)}"
+            )
 
         # Drain proactive uploads before deleting cloud task state so exit
         # metrics include every reused/discarded batch.
@@ -1195,6 +1311,16 @@ class Decoding(ABC):
             'gamma': self.gamma,
             'max_len': self.max_len,
             'requested_output_tokens': generation_budget,
+            'output_token_budget': generation_budget,
+            'cloud_accepted_token_budget': cloud_accepted_budget,
+            'cloud_accepted_tokens': sample_cloud_accepted_tokens,
+            'cloud_accepted_budget_reached': bool(
+                cloud_accepted_budget is not None
+                and sample_cloud_accepted_tokens >= cloud_accepted_budget
+            ),
+            'output_token_cap_reached': bool(
+                completed_output_length >= generation_budget
+            ),
             'ended_with_eos': bool(output_tokens and output_tokens[-1] == self.draft_model.token_eos()),
             'generation_cap_hit': bool(
                 generation_budget == self.max_generated_len
@@ -1212,6 +1338,30 @@ class Decoding(ABC):
             'time_to_first_token_seconds': self._first_accepted_token_latency,
             'avg_token_time': avg_token_time,
             'gpu_power_integral_joules': exit_result.get('gpu_power_integral_joules', None),
+            'model_energy_joules': exit_result.get('model_energy_joules', None),
+            'prompt_prefill_gpu_energy_joules': exit_result.get(
+                'prompt_prefill_gpu_energy_joules'
+            ),
+            'nav_gpu_energy_joules': exit_result.get('nav_gpu_energy_joules'),
+            'prompt_prefill_energy_measurement': exit_result.get(
+                'prompt_prefill_energy_measurement'
+            ),
+            'nav_energy_trace': exit_result.get('nav_energy_trace', []),
+            'energy_measurement_duration_seconds': exit_result.get(
+                'energy_measurement_duration_seconds'
+            ),
+            'energy_measurement_available': exit_result.get(
+                'energy_measurement_available', False
+            ),
+            'energy_scope': exit_result.get(
+                'energy_scope', 'cloud_gpu_prompt_prefill_plus_nav_compute'
+            ),
+            'energy_source': exit_result.get('energy_source', 'nvml_gpu_board_power'),
+            'energy_sample_interval_seconds': exit_result.get(
+                'energy_sample_interval_seconds'
+            ),
+            'energy_included_stages': exit_result.get('energy_included_stages', []),
+            'energy_excluded_stages': exit_result.get('energy_excluded_stages', []),
             'verify_num': exit_result.get('verify_num', None),
             'cloud_cache_version': exit_result.get('cache_version'),
             'discarded_proactive_tokens': exit_result.get('discarded_proactive_tokens', 0),

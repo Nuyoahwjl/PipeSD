@@ -245,6 +245,10 @@ class RunEdgeTests(unittest.TestCase):
                 "token_durations": [0.5, 0.5],
                 "time_to_first_token_seconds": 0.8,
                 "gpu_power_integral_joules": 2.0,
+                "prompt_prefill_gpu_energy_joules": 0.5,
+                "nav_gpu_energy_joules": 1.5,
+                "energy_measurement_duration_seconds": 0.02,
+                "verify_accept_lengths": [1],
             },
             {
                 "output_length": 8,
@@ -252,15 +256,34 @@ class RunEdgeTests(unittest.TestCase):
                 "token_durations": [0.25] * 8,
                 "time_to_first_token_seconds": 0.4,
                 "gpu_power_integral_joules": 8.0,
+                "prompt_prefill_gpu_energy_joules": 1.0,
+                "nav_gpu_energy_joules": 7.0,
+                "energy_measurement_duration_seconds": 0.08,
+                "verify_accept_lengths": [5],
             },
         ]
 
         summary = evaluator._build_run_summary(results)
 
         self.assertEqual(summary["actual_output_tokens"], 10)
-        self.assertAlmostEqual(summary["weighted_tpt_seconds"], 0.3)
+        self.assertEqual(summary["actual_accepted_draft_tokens"], 6)
+        self.assertEqual(
+            summary["tpt_normalization_token_type"],
+            "cloud_accepted_draft_tokens",
+        )
+        self.assertAlmostEqual(summary["weighted_tpt_seconds"], 0.5)
+        self.assertAlmostEqual(summary["accepted_token_tpt_ms"], 500.0)
+        self.assertAlmostEqual(summary["output_token_tpt_ms"], 300.0)
+        self.assertAlmostEqual(summary["throughput_tokens_per_second"], 2.0)
+        self.assertAlmostEqual(summary["output_tokens_per_second"], 10.0 / 3.0)
         self.assertAlmostEqual(summary["mean_ttft_seconds"], 0.6)
-        self.assertAlmostEqual(summary["gpu_energy_joules_per_100_tokens"], 100.0)
+        self.assertAlmostEqual(
+            summary["gpu_energy_joules_per_100_tokens"], 1000.0 / 6.0
+        )
+        self.assertAlmostEqual(summary["prompt_prefill_gpu_energy_joules"], 1.5)
+        self.assertAlmostEqual(summary["nav_gpu_energy_joules"], 8.5)
+        self.assertAlmostEqual(summary["energy_measurement_duration_seconds"], 0.1)
+        self.assertAlmostEqual(summary["average_active_compute_gpu_power_watts"], 100.0)
 
     def test_run_summary_does_not_turn_missing_energy_into_zero(self):
         evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
@@ -273,7 +296,7 @@ class RunEdgeTests(unittest.TestCase):
         self.assertIsNone(summary["gpu_energy_joules"])
         self.assertIsNone(summary["gpu_energy_joules_per_100_tokens"])
 
-    def test_paper_table1_stops_exactly_at_token_budget(self):
+    def test_paper_table1_stops_exactly_at_cloud_accepted_token_budget(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
             evaluator.samples = [
@@ -291,25 +314,49 @@ class RunEdgeTests(unittest.TestCase):
             evaluator._paper_result_path = lambda: Path(tmpdir) / "result.json"
             evaluator.color_print = lambda *args, **kwargs: None
             budgets = []
+            calls = 0
 
             def run_sample(prompt, task_id, **kwargs):
-                budget = kwargs["max_accepted_tokens"]
+                nonlocal calls
+                self.assertIsNone(kwargs.get("max_accepted_tokens"))
+                budget = kwargs["max_cloud_accepted_tokens"]
                 budgets.append(budget)
-                produced = min(6, budget)
+                accepted_by_call = [0, 4, 6]
+                output_by_call = [128, 128, 8]
+                accepted = min(accepted_by_call[calls], budget)
+                produced = output_by_call[calls]
+                calls += 1
                 return {
                     "task_id": task_id,
                     "output_length": produced,
+                    "output_token_budget": 128,
+                    "cloud_accepted_token_budget": budget,
                     "total_time": float(produced),
                     "token_durations": [1.0] * produced,
+                    "verify_accept_lengths": [accepted],
                 }
 
             evaluator.edge_process_draft_model = run_sample
 
             payload = evaluator._run_paper_table1()
 
-            self.assertEqual(budgets, [10, 4])
-            self.assertEqual(payload["summary"]["actual_output_tokens"], 10)
-            self.assertEqual([sample["output_length"] for sample in payload["samples"]], [6, 4])
+            self.assertEqual(budgets, [10, 10, 6])
+            self.assertEqual(payload["summary"]["target_accepted_draft_tokens"], 10)
+            self.assertEqual(payload["summary"]["actual_accepted_draft_tokens"], 10)
+            self.assertEqual(payload["summary"]["stopping_criterion"], "cloud_accepted_draft_tokens")
+            self.assertEqual(payload["summary"]["actual_output_tokens"], 264)
+            self.assertEqual(
+                [sample["output_token_budget"] for sample in payload["samples"]],
+                [128, 128, 128],
+            )
+            self.assertEqual(
+                [sample["accepted_draft_tokens"] for sample in payload["samples"]],
+                [0, 4, 6],
+            )
+            self.assertEqual(
+                [sample["cumulative_accepted_draft_tokens"] for sample in payload["samples"]],
+                [0, 4, 10],
+            )
             self.assertTrue((Path(tmpdir) / "result.json").exists())
 
     def test_compute_emulation_is_disabled_by_default(self):
@@ -488,6 +535,26 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(committed, 2)
         self.assertEqual(output_tokens, [10, 11, 12, 13, 20, 21])
         self.assertEqual(len(decoder._token_durations), 2)
+        self.assertFalse(decoder._last_commit_included_final_token)
+
+    def test_commit_verified_tokens_reports_when_cloud_final_token_is_committed(self):
+        decoder = DummyDecoding(make_args())
+        decoder.max_len = 6
+        decoder._token_durations = []
+        decoder._token_time_ref = 100.0
+        output_tokens = [10, 11]
+
+        with mock.patch("src.engine.time.time", return_value=102.0):
+            committed = decoder._commit_verified_tokens(
+                output_tokens,
+                speculative_tokens=[20, 21],
+                n_accepted=1,
+                final_token=30,
+            )
+
+        self.assertEqual(committed, 2)
+        self.assertEqual(output_tokens, [10, 11, 20, 30])
+        self.assertTrue(decoder._last_commit_included_final_token)
 
     def test_first_accepted_token_latency_is_recorded_before_chunk_averaging(self):
         decoder = DummyDecoding(make_args())
@@ -515,6 +582,27 @@ class RunEdgeTests(unittest.TestCase):
         self.assertFalse(decoder._must_verify_for_budget([1, 2, 3, 4], []))
         self.assertTrue(decoder._must_verify_for_budget([1, 2, 3, 4], [5]))
         self.assertTrue(decoder._must_verify_for_budget([1, 2, 3], [4], [5]))
+
+    def test_cloud_accepted_budget_is_independent_from_output_budget(self):
+        decoder = DummyDecoding(make_args())
+        decoder.max_len = 128
+
+        self.assertFalse(
+            decoder._must_verify_for_accepted_budget(
+                [1, 2], accepted_so_far=5, max_cloud_accepted_tokens=8
+            )
+        )
+        self.assertTrue(
+            decoder._must_verify_for_accepted_budget(
+                [1, 2, 3], accepted_so_far=5, max_cloud_accepted_tokens=8
+            )
+        )
+        self.assertEqual(
+            decoder._advance_accepted_budget(5, 3, max_cloud_accepted_tokens=8),
+            8,
+        )
+        with self.assertRaisesRegex(RuntimeError, "budget exceeded"):
+            decoder._advance_accepted_budget(5, 4, max_cloud_accepted_tokens=8)
 
     def test_pipesd_bootstraps_communication_with_batch_sizes_one_to_eight(self):
         args = make_args(
