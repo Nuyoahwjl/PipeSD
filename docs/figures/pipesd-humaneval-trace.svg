@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 590" role="img" aria-labelledby="title desc">
+  <title id="title">PipeSD HumanEval Task 50 edge-cloud pipeline trace</title>
+  <desc id="desc">Event-ordered timeline reconstructed from the first two verification rounds. Round one generates four draft tokens and sends batches of one, one, and two tokens before NAV. While NAV one runs, eleven proactive tokens are generated and sent in batches of one, one, four, and five. NAV one accepts four of four; NAV two accepts ten of eleven.</desc>
+  <defs>
+    <style>
+      text { fill:#172033; font-family:Arial,"Microsoft YaHei",sans-serif; font-size:13px; }
+      .small { font-size:12px; fill:#4b5563; }
+      .strong { font-weight:600; }
+      .grid { stroke:#d1d5db; stroke-width:1; }
+      .bracket { fill:none; stroke:#6b7280; stroke-width:1.5; }
+      .token { fill:#dce8f5; stroke:#6b8fb5; stroke-width:1.5; }
+      .upload { fill:#ddefe3; stroke:#79a67d; stroke-width:1.5; }
+      .proactive { fill:#f2e7c9; stroke:#b79857; stroke-width:1.5; }
+      .nav { fill:#e8e0f1; stroke:#9673b9; stroke-width:1.5; }
+      .feedback { fill:#d7ece8; stroke:#6f9f98; stroke-width:1.5; }
+      .rollback { fill:#f3d9d9; stroke:#b67a7a; stroke-width:1.5; }
+      .trigger { stroke:#7c3aed; stroke-width:1.5; stroke-dasharray:6 5; }
+      .badge { fill:#f5f7fa; stroke:#c9d1db; stroke-width:1; }
+      rect { rx:5; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#172033"/>
+    </marker>
+  </defs>
+
+  <g aria-label="Trace metadata">
+    <rect class="badge" x="20" y="14" width="175" height="30"/><text x="108" y="34" text-anchor="middle">HumanEval · Task 50</text>
+    <rect class="badge" x="205" y="14" width="205" height="30"/><text x="308" y="34" text-anchor="middle">R1=0.9 · R2=0.3514</text>
+    <rect class="badge" x="420" y="14" width="270" height="30"/><text x="555" y="34" text-anchor="middle">N-hat=20 · plan [1,1,4,14]</text>
+    <rect class="badge" x="700" y="14" width="480" height="30"/><text x="940" y="34" text-anchor="middle">gamma=45.7 ms/token · alpha=28.3 ms · beta=116.3 ms/token</text>
+  </g>
+
+  <g>
+    <line class="grid" x1="150" y1="108" x2="1040" y2="108"/>
+    <line class="grid" x1="150" y1="204" x2="1040" y2="204"/>
+    <line class="grid" x1="150" y1="300" x2="1040" y2="300"/>
+    <line class="grid" x1="150" y1="396" x2="1040" y2="396"/>
+    <line class="grid" x1="150" y1="492" x2="1040" y2="492"/>
+  </g>
+
+  <g class="strong">
+    <text x="20" y="158">Edge draft</text>
+    <text x="20" y="254">Uplink batches</text>
+    <text x="20" y="353">Cloud NAV</text>
+    <text x="20" y="447">Feedback</text>
+  </g>
+
+  <g>
+    <path class="bracket" d="M150 92 V76 H378 V92"/>
+    <text x="264" y="68" text-anchor="middle">Round 1 · window 0 · NAV truncates at D4</text>
+    <path class="bracket" d="M390 92 V76 H1038 V92"/>
+    <text x="714" y="68" text-anchor="middle">Round 2 proactive window · generated while NAV1 is pending</text>
+  </g>
+
+  <g aria-label="Draft token generation">
+    <rect class="token" x="150" y="132" width="48" height="42"/><text x="174" y="158" text-anchor="middle">D1</text>
+    <rect class="token" x="210" y="132" width="48" height="42"/><text x="234" y="158" text-anchor="middle">D2</text>
+    <rect class="token" x="270" y="132" width="48" height="42"/><text x="294" y="158" text-anchor="middle">D3</text>
+    <rect class="token" x="330" y="132" width="48" height="42"/><text x="354" y="158" text-anchor="middle">D4</text>
+    <rect class="token" x="390" y="132" width="48" height="42"/><text x="414" y="158" text-anchor="middle">D5</text>
+    <rect class="token" x="450" y="132" width="48" height="42"/><text x="474" y="158" text-anchor="middle">D6</text>
+    <rect class="token" x="510" y="132" width="48" height="42"/><text x="534" y="158" text-anchor="middle">D7</text>
+    <rect class="token" x="570" y="132" width="48" height="42"/><text x="594" y="158" text-anchor="middle">D8</text>
+    <rect class="token" x="630" y="132" width="48" height="42"/><text x="654" y="158" text-anchor="middle">D9</text>
+    <rect class="token" x="690" y="132" width="48" height="42"/><text x="714" y="158" text-anchor="middle">D10</text>
+    <rect class="token" x="750" y="132" width="48" height="42"/><text x="774" y="158" text-anchor="middle">D11</text>
+    <rect class="token" x="810" y="132" width="48" height="42"/><text x="834" y="158" text-anchor="middle">D12</text>
+    <rect class="token" x="870" y="132" width="48" height="42"/><text x="894" y="158" text-anchor="middle">D13</text>
+    <rect class="token" x="930" y="132" width="48" height="42"/><text x="954" y="158" text-anchor="middle">D14</text>
+    <rect class="token" x="990" y="132" width="48" height="42"/><text x="1014" y="158" text-anchor="middle">D15</text>
+  </g>
+
+  <g aria-label="Pre-NAV upload batches">
+    <rect class="upload" x="150" y="228" width="48" height="42"/><text x="174" y="254" text-anchor="middle">B1 · 1</text>
+    <rect class="upload" x="210" y="228" width="48" height="42"/><text x="234" y="254" text-anchor="middle">B2 · 1</text>
+    <rect class="upload" x="270" y="228" width="108" height="42"/><text x="324" y="254" text-anchor="middle">B3 · 2 · NAV</text>
+  </g>
+
+  <g aria-label="Proactive upload batches">
+    <rect class="proactive" x="390" y="228" width="48" height="42"/><text x="414" y="254" text-anchor="middle">P1 · 1</text>
+    <rect class="proactive" x="450" y="228" width="48" height="42"/><text x="474" y="254" text-anchor="middle">P2 · 1</text>
+    <rect class="proactive" x="510" y="228" width="228" height="42"/><text x="624" y="254" text-anchor="middle">P3 · 4</text>
+    <rect class="proactive" x="750" y="228" width="288" height="42"/><text x="894" y="254" text-anchor="middle">P4 · 5 · waiting NAV</text>
+  </g>
+
+  <g aria-label="NAV triggers">
+    <line class="trigger" x1="384" y1="111" x2="384" y2="483"/>
+    <circle cx="384" cy="217" r="7" fill="#7c3aed"/>
+    <text x="392" y="223">NAV1 trigger</text>
+    <line class="trigger" x1="1044" y1="111" x2="1044" y2="483"/>
+    <circle cx="1044" cy="217" r="7" fill="#7c3aed"/>
+    <text x="1052" y="223">NAV2 trigger</text>
+  </g>
+
+  <g aria-label="Cloud verification">
+    <rect class="nav" x="390" y="324" width="648" height="48"/>
+    <text x="714" y="353" text-anchor="middle">NAV1 · verify D1-D4 · overlaps D5-D15 generation and proactive upload</text>
+    <rect class="nav" x="1050" y="324" width="126" height="48"/>
+    <text x="1110" y="353" text-anchor="middle">NAV2</text>
+  </g>
+
+  <g aria-label="Verification feedback">
+    <line x1="1044" y1="372" x2="1044" y2="416" stroke="#172033" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect class="feedback" x="780" y="420" width="258" height="44"/>
+    <text x="909" y="447" text-anchor="middle">Round 1: accept 4 / 4</text>
+    <line x1="1176" y1="372" x2="1176" y2="416" stroke="#172033" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect class="rollback" x="1050" y="420" width="126" height="44"/>
+    <text x="1113" y="437" text-anchor="middle">Round 2</text>
+    <text x="1113" y="455" text-anchor="middle">accept 10 / 11</text>
+  </g>
+
+  <!-- <g class="small">
+    <line class="bracket" x1="270" y1="266" x2="378" y2="266"/>
+    <text x="315" y="294" text-anchor="middle">planned 4, flushed at 2</text>
+    <line class="bracket" x1="750" y1="266" x2="1038" y2="266"/>
+    <text x="894" y="294" text-anchor="middle">planned 14, flushed at 5</text>
+    <text x="150" y="500">Event order, not a wall-clock-scaled axis. Generation and batching order come from batch_trace; alpha, beta and gamma are measured snapshots.</text>
+    <text x="150" y="524">Task result: 128 output tokens · 23 NAVs · mean draft length 4.91 · rollback rate 30.4% · proactive reused/discarded 52/16.</text>
+  </g> -->
+
+  <g class="small" transform="translate(150 548)" aria-label="Legend">
+    <g transform="translate(0 0)">
+      <rect class="token" x="0" y="0" width="18" height="18"/><text x="27" y="15">draft token</text>
+    </g>
+    <g transform="translate(150 0)">
+      <rect class="upload" x="0" y="0" width="18" height="18"/><text x="27" y="15">pre-NAV upload</text>
+    </g>
+    <g transform="translate(300 0)">
+      <rect class="proactive" x="0" y="0" width="18" height="18"/><text x="27" y="15">proactive upload</text>
+    </g>
+    <g transform="translate(450 0)">
+      <rect class="nav" x="0" y="0" width="18" height="18"/><text x="27" y="15">cloud NAV</text>
+    </g>
+    <g transform="translate(600 0)">
+      <rect class="feedback" x="0" y="0" width="18" height="18"/><text x="27" y="15">accept</text>
+    </g>
+    <g transform="translate(750 0)">
+      <rect class="rollback" x="0" y="0" width="18" height="18"/><text x="27" y="15">rollback occurred</text>
+    </g>
+  </g>
+</svg>
+
