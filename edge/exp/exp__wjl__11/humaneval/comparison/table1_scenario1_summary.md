@@ -1,4 +1,4 @@
-# Table 1 Scenario 1 summary: gsm8k
+# Table 1 Scenario 1 summary: humaneval
 
 > TPT, throughput, GPU J/100, NAV/100, and MiB/100 are normalized by cloud-accepted draft tokens. Token-latency percentiles and TTFT describe committed output tokens. Energy includes cloud prompt prefill and target-model NAV compute only.
 
@@ -6,46 +6,47 @@
 
 - Best TPT: **PipeSD**.
 - Lowest recorded GPU energy per 100 accepted draft tokens: **PipeSD**.
-- PipeSD speedup over the best baseline: **1.043x**.
+- PipeSD speedup over the best baseline: **1.249x**.
 
 ## Performance, latency, and energy
 
 | Method | Accepted | Output | TPT ms/accepted↓ | accepted tok/s↑ | vs Vanilla↑ | GPU J/100 accepted↓ | Energy Δ | Output P50↓ | Output P95↓ | Output P99↓ | Output TTFT↓ | Sample accepted-TPT CV↓ |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 1000 | 1477 | 1062.706 | 0.941 | 1.000 | 45.453 | 0.0% | 461.008 | 2221.609 | 2291.564 | 1735.283 | 18.7% |
-| HSL | 1000 | 1452 | 949.016 | 1.054 | 1.120 | 36.254 | -20.2% | 532.261 | 1781.417 | 1940.024 | 1741.783 | 30.4% |
-| EdgeLLM | 1000 | 1458 | 910.411 | 1.098 | 1.167 | 36.900 | -18.8% | 531.348 | 1778.408 | 1917.864 | 1788.042 | 45.4% |
-| PipeSD | 1000 | 1417 | 872.472 | 1.146 | 1.218 | 34.743 | -23.6% | 494.411 | 1779.891 | 2121.968 | 1824.054 | 42.0% |
+| Vanilla | 1000 | 1234 | 628.705 | 1.591 | 1.000 | 30.060 | 0.0% | 386.652 | 1266.437 | 2665.768 | 2593.122 | 16.5% |
+| HSL | 1000 | 1354 | 773.934 | 1.292 | 0.812 | 29.048 | -3.4% | 460.315 | 959.618 | 1867.952 | 1915.668 | 24.4% |
+| EdgeLLM | 1000 | 1567 | 1258.404 | 0.795 | 0.500 | 39.091 | 30.0% | 827.053 | 1290.572 | 2426.259 | 1989.173 | 43.1% |
+| PipeSD | 1000 | 1200 | 503.444 | 1.986 | 1.249 | 19.121 | -36.4% | 255.726 | 1140.075 | 1917.818 | 2101.268 | 32.1% |
 
 ## Speculative-decoding behavior
 
 | Method | Draft | Accept↑ | NAV/100 accepted↓ | Accepted/NAV↑ | Rollback↓ | Batch | Reuse | Discard | Discard rate↓ |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 3.797 | 55.1% | 47.800 | 2.092 | 60.9% | 3.797 | 0 | 0 | — |
-| HSL | 2.998 | 73.5% | 45.400 | 2.203 | 46.5% | 2.998 | 0 | 0 | — |
-| EdgeLLM | 2.708 | 79.2% | 46.600 | 2.146 | 36.1% | 1.958 | 430 | 430 | 50.0% |
-| PipeSD | 2.995 | 79.3% | 42.100 | 2.375 | 46.3% | 1.371 | 443 | 502 | 53.1% |
+| Vanilla | 5.881 | 72.0% | 23.600 | 4.237 | 42.8% | 5.881 | 0 | 0 | — |
+| HSL | 2.955 | 95.1% | 35.600 | 2.809 | 14.3% | 2.955 | 0 | 0 | — |
+| EdgeLLM | 2.597 | 66.8% | 57.600 | 1.736 | 11.5% | 2.245 | 401 | 354 | 46.9% |
+| PipeSD | 5.279 | 92.9% | 20.400 | 4.902 | 24.0% | 1.670 | 528 | 185 | 25.9% |
 
 ## Network behavior
 
 | Method | Upload MiB↓ | MiB/100 accepted↓ | Uploads↓ | Download KiB↓ | Queue s↓ | Service s↓ | Primary req | Proactive req |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 498.593 | 49.859 | 514 | 271.875 | 0.000 | 221.986 | 514 | 0 |
-| HSL | 373.892 | 37.389 | 490 | 258.843 | 0.000 | 169.082 | 490 | 0 |
-| EdgeLLM | 464.893 | 46.489 | 902 | 321.160 | 59.231 | 217.554 | 375 | 527 |
-| PipeSD | 548.189 | 54.819 | 1366 | 347.570 | 87.786 | 264.092 | 697 | 669 |
+| Vanilla | 384.323 | 38.432 | 266 | 138.111 | 0.000 | 167.853 | 266 | 0 |
+| HSL | 291.317 | 29.132 | 389 | 204.548 | 0.000 | 131.921 | 389 | 0 |
+| EdgeLLM | 512.346 | 51.235 | 861 | 358.454 | 85.210 | 236.433 | 400 | 461 |
+| PipeSD | 401.036 | 40.104 | 823 | 181.584 | 39.848 | 188.789 | 409 | 414 |
 
 ## Runtime termination
 
 | Method | Cap hit | EOS | Total s | Active GPU s | Prefill J | NAV J | NAV mean J | NAV P95 J | Active GPU W |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Vanilla | 91.7% | 0 | 1062.706 | 4.712 | 26.387 | 428.139 | 0.896 | 1.027 | 96.451 |
-| HSL | 75.0% | 2 | 949.016 | 3.706 | 17.188 | 345.357 | 0.761 | 1.290 | 97.828 |
-| EdgeLLM | 83.3% | 0 | 910.411 | 3.771 | 26.705 | 342.299 | 0.735 | 1.147 | 97.848 |
-| PipeSD | 83.3% | 1 | 872.472 | 3.532 | 16.651 | 330.782 | 0.786 | 1.159 | 98.356 |
+| Vanilla | 90.0% | 0 | 628.705 | 3.198 | 28.107 | 272.488 | 1.155 | 1.305 | 93.983 |
+| HSL | 90.9% | 0 | 773.934 | 2.951 | 17.678 | 272.801 | 0.766 | 1.254 | 98.436 |
+| EdgeLLM | 92.3% | 0 | 1258.404 | 3.969 | 21.241 | 369.673 | 0.642 | 1.038 | 98.491 |
+| PipeSD | 90.0% | 0 | 503.444 | 1.978 | 15.521 | 175.687 | 0.861 | 1.359 | 96.674 |
 
 ## Comparability warnings
 
+- Sample-index sets differ; the comparison is not fully paired.
 - At least one artifact was produced from a dirty worktree.
 - The cloud target-model hash is missing from at least one artifact.
 - At least one method has only one matching run; no cross-run confidence interval is available.
