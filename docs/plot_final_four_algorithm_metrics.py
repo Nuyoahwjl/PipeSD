@@ -36,12 +36,12 @@ HATCHES = {
 
 PERFORMANCE_DATA = {
     "HumanEval": {
-        "TPT": [628.705, 773.934, 1258.404, 503.444],
-        "Energy": [30.060, 29.048, 39.091, 19.121],
+        "TPT": [628.705, 578.558, 548.539, 503.444],
+        "Energy": [30.060, 21.643, 20.552, 19.121],
     },
     "GSM8K": {
-        "TPT": [1062.706, 949.016, 1498.874, 872.472],
-        "Energy": [45.453, 36.254, 54.021, 34.743],
+        "TPT": [1062.706, 949.016, 910.411, 872.472],
+        "Energy": [45.453, 36.254, 36.900, 34.743],
     },
 }
 
@@ -165,8 +165,8 @@ def plot_performance_and_energy(orientation: str) -> None:
         energy_ax.set_ylabel("Energy (J/100 tok.)")
         ax.set_xticks(group_centers, ("TPT", "Energy"))
         ax.set_xlim(group_centers[0] - 0.62, group_centers[1] + 0.62)
-        ax.set_ylim(0, max(tpt_values) * 1.23)
-        energy_ax.set_ylim(0, max(energy_values) * 1.23)
+        ax.set_ylim(200, max(tpt_values) * 1.2)
+        energy_ax.set_ylim(10, max(energy_values) * 1.4)
         add_labels(ax, tpt_containers, lambda value: f"{value:.1f}", fontsize=7.5)
         add_labels(energy_ax, energy_containers, lambda value: f"{value:.1f}", fontsize=7.5)
 
