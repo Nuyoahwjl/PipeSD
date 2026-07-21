@@ -165,6 +165,7 @@ class Decoding(ABC):
         self._first_accepted_token_latency = None
         self._last_commit_included_final_token = False
         self.batch_trace = []
+        self.edge_llm_threshold_trace = []
         self._speculative_round_id = 0
 
         self.verify_thresh_single = self.args.verify_thresh_single
@@ -593,19 +594,32 @@ class Decoding(ABC):
     def postprocess(self, input_text, output_text):
         pass
     
-    def update_thresh(self, multiply_times, n_accepted, n_all, accumulated_probs=None):
+    def update_thresh(
+        self,
+        multiply_times,
+        n_accepted,
+        n_all,
+        accumulated_probs=None,
+        phase="primary",
+    ):
         if n_all <= 0:
-            return
+            return None
         confidence = self.accumulated_probs if accumulated_probs is None else accumulated_probs
+        confidence = min(1.0, max(1e-300, float(confidence)))
+        alpha_before = float(self.alpha)
+        round_length = max(1, int(n_all))
+        accepted_length = min(round_length, max(0, int(n_accepted)))
         scheduling_window = max(1, int(getattr(self.dp_scheduler, 'window', n_all)))
         if self.algorithm == 'edgeLLM':
-            # Appendix G.3: compare N_correct with N-hat, not with the
-            # actually generated draft length.  Treat values above N-hat as
-            # reaching the window so numerical drift cannot invert the update.
-            if n_accepted >= scheduling_window:
+            # Appendix G.3 and the authors' released implementation update R1
+            # against the draft tokens in this NAV round.  Using PipeSD's
+            # moving-average scheduling window here causes short, fully
+            # accepted rounds to be misclassified as partial rejections and
+            # can lock R1 at 1.0 (one-token NAVs).
+            if accepted_length == round_length:
                 self.alpha *= getattr(self.args, 'edge_llm_full_accept_decay', 0.5)
             else:
-                exponent = (scheduling_window - n_accepted) / scheduling_window
+                exponent = (round_length - accepted_length) / round_length
                 temp = confidence ** exponent
                 if temp > 0:
                     self.alpha /= temp
@@ -621,6 +635,25 @@ class Decoding(ABC):
             else:
                 self.alpha /= 0.5
         self.alpha = min(1.0, max(1e-9, self.alpha))
+
+        if self.algorithm != 'edgeLLM':
+            return None
+
+        trace = {
+            'phase': phase,
+            'round_id': int(getattr(self, '_speculative_round_id', 0)),
+            'alpha_before': alpha_before,
+            'alpha_after': float(self.alpha),
+            'cumulative_confidence': confidence,
+            'draft_length': round_length,
+            'accepted_length': accepted_length,
+            'proactive_window_before_observation': scheduling_window,
+            'fully_accepted': accepted_length == round_length,
+        }
+        if not hasattr(self, 'edge_llm_threshold_trace'):
+            self.edge_llm_threshold_trace = []
+        self.edge_llm_threshold_trace.append(trace)
+        return trace
     
     def exp2path(self, bandwidth_label: str):
         merge_suffix = ""
@@ -1043,8 +1076,6 @@ class Decoding(ABC):
                 self.verify_spec_lengths.append(len(total_speculative_tokens))
                 self.verify_accept_lengths.append(n_accepted)
                 self.verify_his.append((len(total_speculative_tokens), n_accepted))
-                self._observe_completed_draft_round(len(total_speculative_tokens))
-                merge_plan_batches = self._resolve_algorithm_batch_plan()
                 self.acc_ratio += n_accepted / len(total_speculative_tokens)
                 
                 # 更新输出tokens
@@ -1080,8 +1111,12 @@ class Decoding(ABC):
                         n_accepted=n_accepted,
                         n_all=len(total_speculative_tokens),
                         accumulated_probs=nav_accumulated_probs,
+                        phase="primary",
                     )
                     # print(f"[DEBUG] 更新多项式阈值: verify_thresh_multi={self.verify_thresh_multi:.6f}, accumulated_probs={self.accumulated_probs:.6f}")
+
+                self._observe_completed_draft_round(len(total_speculative_tokens))
+                merge_plan_batches = self._resolve_algorithm_batch_plan()
                 
                 verify_result = None  # 重置验证结果
                 
@@ -1127,8 +1162,6 @@ class Decoding(ABC):
                                 self.verify_spec_lengths.append(waiting_spec_len)
                                 self.verify_accept_lengths.append(n_accepted_waiting)
                                 self.verify_his.append((waiting_spec_len, n_accepted_waiting))
-                                self._observe_completed_draft_round(waiting_spec_len)
-                                merge_plan_batches = self._resolve_algorithm_batch_plan()
                                 if waiting_spec_len > 0:
                                     self.acc_ratio += n_accepted_waiting / waiting_spec_len
                                 self._commit_verified_tokens(
@@ -1146,7 +1179,10 @@ class Decoding(ABC):
                                         n_accepted=n_accepted_waiting,
                                         n_all=waiting_spec_len,
                                         accumulated_probs=waiting_accumulated_probs,
+                                        phase="waiting",
                                     )
+                                self._observe_completed_draft_round(waiting_spec_len)
+                                merge_plan_batches = self._resolve_algorithm_batch_plan()
                                 self._speculative_round_id += 1
                         else:
                             # The cloud has buffered exactly these proactive batches.  Keep
@@ -1370,6 +1406,7 @@ class Decoding(ABC):
             'verify_spec_lengths': self.verify_spec_lengths,
             'verify_accept_lengths': self.verify_accept_lengths,
             'verify_his': self.verify_his,
+            'edge_llm_threshold_trace': self.edge_llm_threshold_trace,
             'diagnostics': diagnostics,
             'environment_measurements': self._environment_snapshot(),
             'batch_trace': self.batch_trace,

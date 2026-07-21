@@ -658,7 +658,7 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(plan, [7])
         resolve_dp.assert_not_called()
 
-    def test_edgellm_threshold_update_compares_accepts_with_nhat(self):
+    def test_edgellm_threshold_update_uses_actual_round_length(self):
         decoder = DummyDecoding(
             make_args(algorithm="edgeLLM", edge_llm_full_accept_decay=0.5)
         )
@@ -666,13 +666,29 @@ class RunEdgeTests(unittest.TestCase):
         decoder.alpha = 0.4
         decoder.accumulated_probs = 0.25
 
-        # Full acceptance of a short, two-token draft is still N_correct < N-hat.
-        decoder.update_thresh(multiply_times=0.01, n_accepted=2, n_all=2)
-        self.assertAlmostEqual(decoder.alpha, 0.4 / (0.25 ** 0.6))
+        # A short round is fully accepted regardless of PipeSD's moving-average
+        # proactive window, so EdgeLLM must decay R1 instead of raising it.
+        trace = decoder.update_thresh(
+            multiply_times=0.01,
+            n_accepted=2,
+            n_all=2,
+        )
+        self.assertAlmostEqual(decoder.alpha, 0.2)
+        self.assertTrue(trace["fully_accepted"])
+        self.assertEqual(trace["draft_length"], 2)
+        self.assertEqual(trace["proactive_window_before_observation"], 5)
 
         decoder.alpha = 0.4
-        decoder.update_thresh(multiply_times=0.01, n_accepted=5, n_all=8)
-        self.assertAlmostEqual(decoder.alpha, 0.2)
+        trace = decoder.update_thresh(
+            multiply_times=0.01,
+            n_accepted=3,
+            n_all=5,
+            accumulated_probs=0.25,
+            phase="waiting",
+        )
+        self.assertAlmostEqual(decoder.alpha, 0.4 / (0.25 ** 0.4))
+        self.assertFalse(trace["fully_accepted"])
+        self.assertEqual(trace["phase"], "waiting")
 
     def test_edgellm_threshold_update_uses_confidence_snapshot_for_its_nav(self):
         decoder = DummyDecoding(
@@ -689,7 +705,12 @@ class RunEdgeTests(unittest.TestCase):
             accumulated_probs=0.25,
         )
 
-        self.assertAlmostEqual(decoder.alpha, 0.2 / (0.25 ** 0.6))
+        self.assertAlmostEqual(decoder.alpha, 0.2 / (0.25 ** (1 / 3)))
+        self.assertEqual(len(decoder.edge_llm_threshold_trace), 1)
+        self.assertEqual(
+            decoder.edge_llm_threshold_trace[0]["cumulative_confidence"],
+            0.25,
+        )
 
     def test_edgellm_result_name_records_paper_decay_not_legacy_multiplier(self):
         decoder = DummyDecoding(
