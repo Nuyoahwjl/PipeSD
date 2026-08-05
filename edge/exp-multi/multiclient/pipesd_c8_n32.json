@@ -1,0 +1,19 @@
+{
+  "makespan_seconds": 1560.1976220607758,
+  "total_output_tokens": 4096,
+  "num_completed_samples": 32,
+  "total_cloud_energy_joules": 849.1212603079704,
+  "token_throughput_tps": 2.625308449444903,
+  "sample_throughput_sps": 0.020510222261288305,
+  "energy_per_token_joules": 0.20730499519237558,
+  "energy_per_sample_joules": 26.535039384624074,
+  "sample_window_makespan_seconds": 1547.2890810966492,
+  "sample_window_token_throughput_tps": 2.6472105633272736,
+  "sample_window_sample_throughput_sps": 0.020681332525994325,
+  "dataset": "humaneval",
+  "algorithm": "pipesd",
+  "num_clients": 8,
+  "pilot_samples": 32,
+  "workload_mode": "distinct",
+  "base_tag": "pipesd_c8_n32"
+}

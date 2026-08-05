@@ -43,7 +43,7 @@ def load_total_samples(dataset: str) -> int:
 
 
 def load_entries_for_tag(dataset: str, algorithm: str, result_tag: str) -> List[dict]:
-    exp_dir = Path("exp") / "exp__wjl" / dataset / algorithm
+    exp_dir = Path("exp-multi") / "exp__wjl" / dataset / algorithm
     entries: List[dict] = []
     if not exp_dir.exists():
         return entries
@@ -108,7 +108,7 @@ def main() -> int:
     )
 
     summary_path = Path(args.summary_path) if args.summary_path else (
-        Path("exp") / "multiclient" / f"{args.base_tag}.json"
+        Path("exp-multi") / "multiclient" / f"{args.base_tag}.json"
     )
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
