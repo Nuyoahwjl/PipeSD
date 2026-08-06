@@ -30,6 +30,40 @@ class MultiClientHelpersTests(unittest.TestCase):
 
         self.assertEqual(assignments, [[0, 1], [0, 1], [0, 1], [0, 1]])
 
+    def test_partition_replicated_gives_every_client_the_full_workload(self):
+        assignments = partition_sample_indices(
+            total_samples=8,
+            num_clients=2,
+            workload_mode="replicated",
+            pilot_samples=8,
+        )
+
+        self.assertEqual(assignments, [list(range(8)), list(range(8))])
+
+    def test_summary_reports_fairness_and_cloud_batching(self):
+        metrics = summarize_multiclient_metrics(
+            entries=[
+                {
+                    "client_id": 0,
+                    "output_length": 10,
+                    "total_time": 2.0,
+                    "cloud_batch_trace": [{"actual_batch_size": 2}],
+                },
+                {
+                    "client_id": 1,
+                    "output_length": 10,
+                    "total_time": 4.0,
+                    "cloud_batch_trace": [{"actual_batch_size": 1}],
+                },
+            ],
+            makespan=10.0,
+        )
+
+        self.assertEqual(metrics["jain_token_throughput_fairness"], 1.0)
+        self.assertEqual(metrics["cloud_actual_batch_size_mean"], 1.5)
+        self.assertEqual(metrics["cloud_batched_request_fraction"], 0.5)
+        self.assertEqual(metrics["sample_latency_p50_seconds"], 3.0)
+
     def test_summarize_multiclient_metrics_reports_throughput_and_energy(self):
         metrics = summarize_multiclient_metrics(
             entries=[

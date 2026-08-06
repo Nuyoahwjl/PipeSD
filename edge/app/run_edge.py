@@ -8,6 +8,7 @@ import json
 import hashlib
 import itertools
 import platform
+import random
 import socket
 import statistics
 import subprocess
@@ -114,6 +115,9 @@ class CloudEdgeSpeculativeEval(Decoding):
             prompt = input_text['prompt'].strip()
             raw_task_id = input_text['task_id']
 
+        runtime_task_id = input_text.get('runtime_task_id')
+        if runtime_task_id is not None:
+            return prompt, int(runtime_task_id)
         try:
             task_id = int(str(raw_task_id).split('/')[-1])
         except Exception:
@@ -122,6 +126,81 @@ class CloudEdgeSpeculativeEval(Decoding):
         if isinstance(task_id, int):
             task_id += task_id_offset
         return prompt, task_id
+
+    def _wait_for_duration_barrier(self):
+        barrier_value = getattr(self.args, 'barrier_dir', '')
+        if not barrier_value:
+            raise ValueError('--barrier_dir is required with --run_duration_s')
+        barrier_dir = Path(barrier_value)
+        barrier_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load the CPU draft model and complete transport calibration before
+        # declaring this edge ready. These costs are outside the measured window.
+        self._reset_state()
+        self.proactive_sender.close()
+        self.sender.close()
+
+        client_id = int(getattr(self.args, 'client_id', 0))
+        ready_path = barrier_dir / f'ready-{client_id}.json'
+        ready_path.write_text(
+            json.dumps({'client_id': client_id, 'ready_at': time.time()}),
+            encoding='utf-8',
+        )
+        start_path = barrier_dir / 'start.json'
+        deadline = time.monotonic() + float(
+            getattr(self.args, 'barrier_timeout_s', 1800.0)
+        )
+        while not start_path.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'timed out waiting for {start_path}')
+            time.sleep(0.05)
+        schedule = json.loads(start_path.read_text(encoding='utf-8'))
+        warmup_start = float(schedule['warmup_start_epoch'])
+        while time.time() < warmup_start:
+            time.sleep(min(0.05, warmup_start - time.time()))
+        return schedule
+
+    def _run_duration_workload(self):
+        if not self.samples:
+            raise RuntimeError('duration workload has no HumanEval samples')
+        schedule = self._wait_for_duration_barrier()
+        measurement_start = float(schedule['measurement_start_epoch'])
+        measurement_end = float(schedule['measurement_end_epoch'])
+        self.args.measurement_window_start = measurement_start
+        self.args.measurement_window_end = measurement_end
+        # All clients use the same trace clock. Per-client profile rotation is
+        # handled by --software_bandwidth_profile_offset.
+        self._network_profile_started_at = time.monotonic() + (
+            measurement_start - time.time()
+        )
+
+        client_id = int(getattr(self.args, 'client_id', 0))
+        rng = random.Random(
+            int(getattr(self.args, 'workload_seed', 3407)) + client_id
+        )
+        ordered_samples = list(self.samples)
+        rng.shuffle(ordered_samples)
+        iteration = 0
+        while time.time() < measurement_end:
+            sample = dict(ordered_samples[iteration % len(ordered_samples)])
+            sample_index = int(sample.get('sample_index', iteration % len(ordered_samples)))
+            sample['runtime_task_id'] = (
+                int(getattr(self.args, 'task_id_offset', 0)) + iteration
+            )
+            sample_started = time.time()
+            self.args.current_dataset_sample_index = sample_index
+            self.args.current_workload_iteration = iteration
+            self.args.current_measurement_phase = (
+                'measurement' if sample_started >= measurement_start else 'warmup'
+            )
+            prompt, task_id = self.preprocess(sample)
+            self._reset_state()
+            self.edge_process_draft_model(prompt, task_id)
+            iteration += 1
+        self.color_print(
+            f'[Main] client={client_id} completed {iteration} duration-workload samples.',
+            2,
+        )
 
     def postprocess(self, input_text, output_text):
         bos_token = '<s>'
@@ -708,6 +787,8 @@ class CloudEdgeSpeculativeEval(Decoding):
             self.color_print("[Main] BO 完成，使用最优阈值继续正式评测。", 2)
         # start_time = time.time()
         seed_everything(self.args.seed)
+        if float(getattr(self.args, 'run_duration_s', 0.0)) > 0:
+            return self._run_duration_workload()
         if getattr(self.args, "evaluation_protocol", "sample_index") == "paper_table1":
             return self._run_paper_table1()
         self._reset_run_duration_buffers()
@@ -744,6 +825,10 @@ if __name__ == "__main__":
             sys.exit(0)
         except Exception as e:
             print(f"Error: {e}")
+            if 'args' in locals() and float(
+                getattr(args, 'run_duration_s', 0.0)
+            ) > 0:
+                raise
             if i == MAX_RETRY - 1:
                 raise
             time.sleep(2)

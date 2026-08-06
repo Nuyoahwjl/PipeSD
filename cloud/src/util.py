@@ -72,9 +72,30 @@ def parse_arguments():
     parser.add_argument('--top_p', type=float, default=1, help='top_p for ungreedy sampling strategy.')
     parser.add_argument('--gamma', type=int, default=4, help='guess time.')
     parser.add_argument("--num_drafts", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument(
+        "--backend",
+        choices=["batched", "serial"],
+        default="batched",
+        help="batched uses one llama.cpp context with independent sequence ids",
+    )
+    parser.add_argument(
+        "--max_sequences", type=int, default=8,
+        help="maximum number of simultaneous edge sessions",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=1024,
+        help="maximum tokens in one cross-client llama_decode call",
+    )
+    parser.add_argument("--ubatch_size", type=int, default=64)
+    parser.add_argument(
+        "--batch_wait_ms", type=float, default=2.0,
+        help="micro-batching collection window",
+    )
+    parser.add_argument("--batch_request_timeout_s", type=float, default=300.0)
+    parser.add_argument("--disable_flash_attention", action="store_true")
+    parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--ctx_size", type=int, default=1024)
+    parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     args.exp_name = os.path.join(os.getcwd(), "exp", args.exp_name)
     os.makedirs(args.exp_name, exist_ok=True)

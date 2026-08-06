@@ -407,6 +407,21 @@ class RunEdgeTests(unittest.TestCase):
         self.assertEqual(prompt, "q1")
         self.assertEqual(task_id, 1007)
 
+    def test_preprocess_uses_unique_duration_workload_task_id_directly(self):
+        evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
+        evaluator.args = SimpleNamespace(dataset="humaneval", task_id_offset=1_000_000)
+
+        _, task_id = CloudEdgeSpeculativeEval.preprocess(
+            evaluator,
+            {
+                "prompt": "def f(): pass",
+                "task_id": "HumanEval/7",
+                "runtime_task_id": 1_000_042,
+            },
+        )
+
+        self.assertEqual(task_id, 1_000_042)
+
     def test_reset_state_initializes_tracking_fields(self):
         args = make_args()
 

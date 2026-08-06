@@ -101,6 +101,14 @@ class Decoding(ABC):
         self.software_bandwidth_profile = _parse_bandwidth_profile(
             getattr(args, 'software_bandwidth_profile', '')
         )
+        if self.software_bandwidth_profile:
+            profile_offset = int(
+                getattr(args, 'software_bandwidth_profile_offset', 0)
+            ) % len(self.software_bandwidth_profile)
+            self.software_bandwidth_profile = (
+                self.software_bandwidth_profile[profile_offset:]
+                + self.software_bandwidth_profile[:profile_offset]
+            )
         # Start a dynamic trace only after model loading, so every method sees
         # profile entry zero at the beginning of measured inference.
         self._network_profile_started_at = None
@@ -1334,6 +1342,22 @@ class Decoding(ABC):
         diagnostics = self._build_verify_diagnostics(output_length)
         exp_result = {
             'task_id': task_id,
+            'client_id': int(getattr(self.args, 'client_id', 0)),
+            'dataset_sample_index': getattr(
+                self.args, 'current_dataset_sample_index', None
+            ),
+            'workload_iteration': getattr(
+                self.args, 'current_workload_iteration', None
+            ),
+            'measurement_phase': getattr(
+                self.args, 'current_measurement_phase', 'single_pass'
+            ),
+            'measurement_window_start': getattr(
+                self.args, 'measurement_window_start', None
+            ),
+            'measurement_window_end': getattr(
+                self.args, 'measurement_window_end', None
+            ),
             'output_length': output_length,
             # 'counted_length': eff_num,
             'total_time': spent_time,
@@ -1383,6 +1407,8 @@ class Decoding(ABC):
                 'prompt_prefill_energy_measurement'
             ),
             'nav_energy_trace': exit_result.get('nav_energy_trace', []),
+            'cloud_batch_trace': exit_result.get('cloud_batch_trace', []),
+            'cloud_batch_scheduler': exit_result.get('cloud_batch_scheduler'),
             'energy_measurement_duration_seconds': exit_result.get(
                 'energy_measurement_duration_seconds'
             ),

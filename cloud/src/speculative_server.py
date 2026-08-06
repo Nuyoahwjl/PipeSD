@@ -14,6 +14,13 @@ import torch
 from contextlib import nullcontext
 from src.util import seed_everything, parse_arguments, softmax, max_fn, sample, GPUEnergyMonitor, EnergyTracker
 try:
+    from src.batch_backend import LlamaCppBatchBackend, VerifyRequest
+    from src.batch_scheduler import VerificationBatchScheduler
+except ImportError:  # Keeps the legacy unit-test harness importable.
+    LlamaCppBatchBackend = None
+    VerifyRequest = None
+    VerificationBatchScheduler = None
+try:
     from llama_cpp import Llama, llama_cpp
     GGUF_SUPPORT = True
 except ImportError:
@@ -25,17 +32,23 @@ APP_PORT = 8000
 POWER_SAMPLE_INTERVAL = float(os.environ.get("GPU_POWER_SAMPLE_INTERVAL", 0.005))
 
 app = FastAPI(title="Speculative Decoding Communication Gateway")
+shared_model = None
+batch_scheduler = None
+server_args = None
 
 # logging setup
-LOG_DIR = os.path.join(os.getcwd(), "logs")
+LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
 os.makedirs(LOG_DIR, exist_ok=True)
 logger = logging.getLogger("communication_service")
 logger.setLevel(logging.INFO)
 log_path = os.path.join(LOG_DIR, "communication_service.log")
-fh = logging.FileHandler(log_path)
 formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-fh.setFormatter(formatter)
 if not logger.handlers:
+    try:
+        fh = logging.FileHandler(log_path)
+    except OSError:
+        fh = logging.NullHandler()
+    fh.setFormatter(formatter)
     logger.addHandler(fh)
 
 consistency = True
@@ -128,8 +141,11 @@ class InferenceTask:
         self.prefix = prefix
         self.args = args
         # self.load_model()
-        shared_model.set_task(task_id)
-        self.target_model = shared_model.model  # 使用共享模型实例
+        if shared_model is not None:
+            shared_model.set_task(task_id)
+            self.target_model = shared_model.model  # legacy serial backend
+        else:
+            self.target_model = None
         self.model_state = None
         self.lock = threading.RLock()
         self.n_past = 0
@@ -169,6 +185,7 @@ class InferenceTask:
         self.energy_measurement_duration_seconds = 0.0
         self.prompt_prefill_energy_measurement = None
         self.nav_energy_trace = []
+        self.cloud_batch_trace = []
         self.last_verify_power_integral = 0.0
         self.veridy_num = 0
         self.cache_version = 0
@@ -534,19 +551,60 @@ active_tasks_lock = threading.RLock()
 model_lock = threading.RLock()
 
 
+def _runtime_args():
+    return server_args if server_args is not None else parse_arguments()
+
+
+def _batch_enabled():
+    return batch_scheduler is not None
+
+
 def handle_init_request(request: InitRequest):
-    args = parse_arguments()
+    args = _runtime_args()
     task = InferenceTask(request.task_id, request.tokens, args)
-    with task.lock:
-        with model_lock:
-            success = task.proc_prefix()
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to process prefix tokens.")
+    init_result = None
+    if _batch_enabled():
+        init_result = batch_scheduler.initialize(request.task_id, request.tokens)
+        task.n_past = int(init_result['n_past'])
+        prefill_energy = float(init_result.get('prefill_gpu_power_integral', 0.0))
+        task.record_energy_measurement(
+            stage='init_eval',
+            energy_joules=prefill_energy,
+            duration_seconds=float(init_result.get('prefill_seconds', 0.0)),
+            sample_count=0,
+        )
+        task.cloud_batch_trace.append({
+            key: init_result.get(key) for key in (
+                'batch_stage', 'batch_id', 'actual_batch_size',
+                'actual_batch_tokens', 'batch_queue_seconds',
+                'prefill_seconds', 'evaluated_tokens', 'seq_id',
+                'prefill_gpu_power_integral', 'batch_energy_joules',
+                'energy_allocation',
+            )
+        })
+        task.cloud_batch_trace.append({
+            key: init_result.get(key) for key in (
+                'batch_stage', 'batch_id', 'actual_batch_size',
+                'actual_batch_tokens', 'batch_queue_seconds',
+                'prefill_seconds', 'evaluated_tokens', 'seq_id',
+                'prefill_gpu_power_integral', 'batch_energy_joules',
+                'energy_allocation',
+            )
+        })
+    else:
+        with task.lock:
+            with model_lock:
+                success = task.proc_prefix()
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to process prefix tokens.")
 
     with active_tasks_lock:
         active_tasks[request.task_id] = task
 
-    return {'init': 'success', 'n_past': task.n_past}
+    response = {'init': 'success', 'n_past': task.n_past}
+    if init_result is not None:
+        response.update({'backend': 'batched', 'seq_id': init_result.get('seq_id')})
+    return response
 
 
 def handle_start_request(request: TaskRequest):
@@ -688,6 +746,18 @@ def handle_propose_payload(payload):
         task.verify_in_progress = True
         task.active_verify_round_id = int(round_id) if round_id is not None else task.cache_version
         active_round_id = task.active_verify_round_id
+        if _batch_enabled():
+            verify_tokens = [
+                int(token) for token in task.accumulated_tokens if token is not None
+            ]
+            verify_probs = [
+                np.asarray(probability, dtype=np.float64)
+                for token, probability in zip(
+                    task.accumulated_tokens, task.accumulated_probs
+                )
+                if token is not None
+            ]
+            task.reset_accumulated()
         # Wake a proactive waiting-NAV request that arrived before its parent.
         # It will observe ``pending`` and continue waiting for completion.
         task.verify_condition.notify_all()
@@ -695,24 +765,66 @@ def handle_propose_payload(payload):
     # Do not hold task.lock here: proactive HTTP requests must remain able to
     # populate task.proactive_buffers while target-model verification runs.
     try:
-        with model_lock:
-            nav_measurement_count_before = len(task.nav_energy_trace)
-            task.restore_model_state()
-            result = task.verify_tokens(n_past_at_receive)
-            task.save_model_state()
-            task.veridy_num += 1
-            nav_energy = (
-                task.annotate_last_nav_energy(
-                    round_id=active_round_id,
-                    n_past=n_past_at_receive,
-                    result=result,
-                )
-                if len(task.nav_energy_trace) > nav_measurement_count_before
-                else None
+        if _batch_enabled():
+            request = VerifyRequest(
+                task_id=task.task_id,
+                n_past=int(n_past_at_receive),
+                tokens=verify_tokens,
+                draft_probs=verify_probs,
+                seed=int(getattr(task.args, 'seed', 1234)),
+                temp=float(task.temp),
+                top_k=int(task.top_k),
+                top_p=float(task.top_p),
             )
-            if nav_energy is not None:
-                result['gpu_power_integral'] = nav_energy['energy_joules']
-                result['nav_energy_measurement'] = nav_energy
+            result = batch_scheduler.submit(request)
+            task.n_past = int(result['n_past'])
+            task.cache_version += 1
+            result['cache_version'] = task.cache_version
+            task.veridy_num += 1
+            nav_energy = task.record_energy_measurement(
+                stage='verify_total',
+                energy_joules=float(result.get('gpu_power_integral', 0.0)),
+                duration_seconds=float(result.get('batch_decode_seconds', 0.0)),
+                sample_count=0,
+            )
+            nav_energy.update({
+                'speculative_round_id': active_round_id,
+                'n_past': int(n_past_at_receive),
+                'n_speculative': int(result.get('n_speculative', 0)),
+                'n_accepted': int(result.get('n_accepted', 0)),
+                'batch_id': result.get('batch_id'),
+                'actual_batch_size': result.get('actual_batch_size'),
+                'actual_batch_tokens': result.get('actual_batch_tokens'),
+                'energy_allocation': result.get('energy_allocation'),
+            })
+            result['nav_energy_measurement'] = dict(nav_energy)
+            task.cloud_batch_trace.append({
+                key: result.get(key) for key in (
+                    'batch_id', 'actual_batch_size', 'actual_batch_tokens',
+                    'batch_queue_seconds', 'batch_decode_seconds',
+                    'evaluated_tokens', 'seq_id', 'gpu_power_integral',
+                    'batch_energy_joules', 'energy_allocation',
+                )
+            })
+        else:
+            with model_lock:
+                nav_measurement_count_before = len(task.nav_energy_trace)
+                task.restore_model_state()
+                result = task.verify_tokens(n_past_at_receive)
+                task.save_model_state()
+                task.veridy_num += 1
+                nav_energy = (
+                    task.annotate_last_nav_energy(
+                        round_id=active_round_id,
+                        n_past=n_past_at_receive,
+                        result=result,
+                    )
+                    if len(task.nav_energy_trace) > nav_measurement_count_before
+                    else None
+                )
+                if nav_energy is not None:
+                    result['gpu_power_integral'] = nav_energy['energy_joules']
+                    result['nav_energy_measurement'] = nav_energy
     finally:
         with task.verify_condition:
             if 'result' in locals():
@@ -756,6 +868,8 @@ def handle_exit_payload(payload):
         with active_tasks_lock:
             task = active_tasks.pop(task_id, None) if task_id is not None else None
         if task is not None:
+            if _batch_enabled():
+                batch_scheduler.close_session(task_id)
             task.stop_energy_tracking()
             energy_available = bool(
                 gpu_energy_monitor and gpu_energy_monitor.enabled
@@ -785,6 +899,9 @@ def handle_exit_payload(payload):
             response['nav_energy_trace'] = [
                 dict(measurement) for measurement in task.nav_energy_trace
             ]
+            response['cloud_batch_trace'] = [
+                dict(measurement) for measurement in task.cloud_batch_trace
+            ]
             response['energy_measurement_duration_seconds'] = (
                 task.energy_measurement_duration_seconds
                 if energy_available
@@ -806,6 +923,11 @@ def handle_exit_payload(payload):
                 'model_load',
                 'model_state_restore_and_save',
             ]
+            if _batch_enabled():
+                response['energy_excluded_stages'].remove(
+                    'model_state_restore_and_save'
+                )
+                response['cloud_batch_scheduler'] = batch_scheduler.snapshot()
             response['verify_num'] = task.veridy_num
             response['cache_version'] = task.cache_version
             response['discarded_proactive_tokens'] = task.discarded_proactive_tokens
@@ -867,7 +989,14 @@ async def exit_task(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "backend": "inference_service", "active_tasks": len(active_tasks)}
+    response = {
+        "status": "running",
+        "backend": "batched" if _batch_enabled() else "serial",
+        "active_tasks": len(active_tasks),
+    }
+    if _batch_enabled():
+        response["batch_scheduler"] = batch_scheduler.snapshot()
+    return response
 
 @app.get("/")
 async def root():
@@ -875,8 +1004,42 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"🚀 启动通信服务，监听端口 {APP_PORT}...")
-    args = parse_arguments()
-    seed_everything(args.seed)
-    shared_model = MyModel(args.target_model, 16384)
-    uvicorn.run(app, host="0.0.0.0", port=APP_PORT, workers=1)
+    server_args = parse_arguments()
+    seed_everything(server_args.seed)
+    if server_args.backend == 'batched':
+        if LlamaCppBatchBackend is None or VerificationBatchScheduler is None:
+            raise RuntimeError("batched backend modules could not be imported")
+        backend = LlamaCppBatchBackend(
+            model_path=server_args.target_model,
+            max_sequences=server_args.max_sequences,
+            context_tokens_per_sequence=server_args.ctx_size,
+            decode_batch_tokens=server_args.batch_size,
+            physical_batch_tokens=server_args.ubatch_size,
+            threads=server_args.threads,
+            flash_attention=not server_args.disable_flash_attention,
+        )
+        batch_scheduler = VerificationBatchScheduler(
+            backend,
+            max_batch_clients=server_args.max_sequences,
+            max_batch_tokens=server_args.batch_size,
+            batch_wait_ms=server_args.batch_wait_ms,
+            request_timeout_s=server_args.batch_request_timeout_s,
+            energy_context_factory=lambda sink, stage: EnergyTracker(
+                gpu_energy_monitor,
+                sink,
+                stage,
+                POWER_SAMPLE_INTERVAL,
+                logger=logger,
+            ) if gpu_energy_monitor.enabled else nullcontext(),
+        )
+    else:
+        shared_model = MyModel(server_args.target_model, server_args.ctx_size)
+    print(
+        f"🚀 启动通信服务，监听端口 {server_args.port}，"
+        f"backend={server_args.backend}..."
+    )
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=server_args.port, workers=1)
+    finally:
+        if batch_scheduler is not None:
+            batch_scheduler.shutdown()

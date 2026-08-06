@@ -147,6 +147,13 @@ def parse_arguments():
     parser.add_argument('--target_output_tokens', type=int, default=1000, help='Accepted-token budget for paper_table1.')
     parser.add_argument('--run_id', type=str, default='', help='Stable run identifier; generated automatically when omitted.')
     parser.add_argument('--task_id_offset', type=int, default=0, help='Offset added to each task id to avoid collisions across concurrent clients.')
+    parser.add_argument('--client_id', type=int, default=0, help='Logical edge client id recorded in multi-client results.')
+    parser.add_argument('--run_duration_s', type=float, default=0.0, help='Measured closed-loop workload duration; 0 keeps the index-based one-pass behavior.')
+    parser.add_argument('--warmup_duration_s', type=float, default=0.0, help='Warm-up duration before the measured window.')
+    parser.add_argument('--barrier_dir', type=str, default='', help='Directory used by the launcher to synchronize model-ready clients.')
+    parser.add_argument('--barrier_timeout_s', type=float, default=1800.0)
+    parser.add_argument('--workload_seed', type=int, default=3407)
+    parser.add_argument('--software_bandwidth_profile_offset', type=int, default=0, help='Rotate the dynamic link trace per edge to avoid synchronized synthetic links.')
     parser.add_argument(
         '--use_env_proxy',
         action='store_true',
