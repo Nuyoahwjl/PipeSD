@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDGE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-EVAL_SCRIPT="$SCRIPT_DIR/eval_gsm8k.sh"
+EVAL_SCRIPT="$SCRIPT_DIR/eval_humaneval.sh"
 cd "$EDGE_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -13,11 +13,11 @@ if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
-# Use the HumanEval Figure 5 uplink levels as a matched GSM8K extension:
-# 10/20/40/80 Mbps. The current CLI uses MB/s, hence 1.25/2.5/5/10 below.
-# BANDWIDTHS_MBPS remains as a compatibility alias; UPLINK_BANDWIDTHS_MBPS
-# takes precedence when both are set. Algorithm parameters stay fixed across
-# bandwidths because the canonical eval script is reused without per-point BO.
+# Paper Figure 5 varies only the uplink at 10/20/40/80 Mbps. The current CLI
+# uses MB/s, hence 1.25/2.5/5/10 below. BANDWIDTHS_MBPS remains as a
+# compatibility alias; UPLINK_BANDWIDTHS_MBPS takes precedence when both are
+# set. Algorithm parameters stay fixed across bandwidths because the canonical
+# eval script is reused without per-point BO.
 UPLINK_BANDWIDTHS_MBPS="${UPLINK_BANDWIDTHS_MBPS:-${BANDWIDTHS_MBPS:-1.25 2.5 5 10}}"
 read -r -a bandwidths <<< "$UPLINK_BANDWIDTHS_MBPS"
 if (( ${#bandwidths[@]} == 0 )); then
@@ -68,9 +68,9 @@ run_bandwidth() {
   local bw="$4"
   local bw_label="${bw//./p}"
 
-  echo "[sweep] dataset=gsm8k repeat=$repeat seed=$repeat_seed uplink=${bw}MB/s downlink=${DOWNLINK_BANDWIDTH_MBPS}MB/s tag=$result_tag"
+  echo "[sweep] dataset=humaneval repeat=$repeat seed=$repeat_seed uplink=${bw}MB/s downlink=${DOWNLINK_BANDWIDTH_MBPS}MB/s tag=$result_tag"
   PYTHON_BIN="$PYTHON_BIN" \
-  DATASET=gsm8k \
+  DATASET=humaneval \
   SEED="$repeat_seed" \
   BANDWIDTH_MBPS="$bw" \
   DOWNLINK_BANDWIDTH_MBPS="$DOWNLINK_BANDWIDTH_MBPS" \
