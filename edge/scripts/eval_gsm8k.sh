@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDGE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$EDGE_DIR/.." && pwd)"
+CLOUD_DIR="$REPO_DIR/cloud"
 cd "$EDGE_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
@@ -36,6 +38,49 @@ SOFTWARE_BANDWIDTH_PROFILE="${SOFTWARE_BANDWIDTH_PROFILE:-}"
 SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S="${SOFTWARE_BANDWIDTH_CHANGE_INTERVAL_S:-20}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+START_CLOUD="${START_CLOUD:-1}"
+CLOUD_BACKEND="${CLOUD_BACKEND:-serial}"
+CLOUD_PORT="${CLOUD_PORT:-8000}"
+CLOUD_CTX_SIZE="${CLOUD_CTX_SIZE:-16384}"
+CLOUD_MAX_SEQUENCES="${CLOUD_MAX_SEQUENCES:-1}"
+CLOUD_BATCH_SIZE="${CLOUD_BATCH_SIZE:-1024}"
+CLOUD_UBATCH_SIZE="${CLOUD_UBATCH_SIZE:-64}"
+CLOUD_BATCH_WAIT_MS="${CLOUD_BATCH_WAIT_MS:-2}"
+CLOUD_THREADS="${CLOUD_THREADS:-4}"
+CLOUD_MAX_TOKENS="${CLOUD_MAX_TOKENS:-128}"
+CLOUD_CPUSET="${CLOUD_CPUSET:-}"
+CLOUD_START_TIMEOUT_S="${CLOUD_START_TIMEOUT_S:-300}"
+RUN_LABEL="${RUN_LABEL:-$(date +%Y%m%d-%H%M%S)}"
+
+PYTHON_BIN="$(command -v "$PYTHON_BIN" || true)"
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+  echo "Python interpreter is not executable: ${PYTHON_BIN:-<not found>}" >&2
+  exit 1
+fi
+if [[ "$CLOUD_BACKEND" != "serial" && "$CLOUD_BACKEND" != "batched" ]]; then
+  echo "CLOUD_BACKEND must be serial or batched: $CLOUD_BACKEND" >&2
+  exit 1
+fi
+if [[ -n "$CLOUD_CPUSET" ]] && ! command -v taskset >/dev/null 2>&1; then
+  echo "taskset is required when CLOUD_CPUSET is set" >&2
+  exit 1
+fi
+
+export PIPE_SD_SERVER_URL="${PIPE_SD_SERVER_URL:-http://127.0.0.1:${CLOUD_PORT}}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export GPU_ENERGY_DEVICE="${GPU_ENERGY_DEVICE:-0}"
+HEALTH_URL="${PIPE_SD_SERVER_URL%/}/health"
+CLOUD_LOG="${CLOUD_LOG:-$CLOUD_DIR/logs/eval-${DATASET}-${RUN_LABEL}.log}"
+CLOUD_PID=""
+
+cleanup() {
+  if [[ -n "$CLOUD_PID" ]] && kill -0 "$CLOUD_PID" 2>/dev/null; then
+    kill "$CLOUD_PID"
+    wait "$CLOUD_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
 if [[ -z "$PIPESD_SINGLE_THRESH" || -z "$PIPESD_MULTI_THRESH" ]]; then
   PIPESD_BO_CONFIG="${PIPESD_BO_CONFIG:-exp/exp__wjl/gsm8k/pipesd/latest_bayes_best.json}"
   if [[ ! -f "$PIPESD_BO_CONFIG" ]]; then
@@ -48,6 +93,71 @@ if [[ -z "$PIPESD_SINGLE_THRESH" || -z "$PIPESD_MULTI_THRESH" ]]; then
   PIPESD_SINGLE_THRESH="${PIPESD_SINGLE_THRESH:-$CONFIG_SINGLE}"
   PIPESD_MULTI_THRESH="${PIPESD_MULTI_THRESH:-$CONFIG_MULTI}"
 fi
+
+if [[ "$START_CLOUD" == "1" ]] && "$PYTHON_BIN" -c \
+  'import sys,urllib.request; urllib.request.urlopen(sys.argv[1], timeout=1)' \
+  "$HEALTH_URL" >/dev/null 2>&1; then
+  echo "A server is already listening at $PIPE_SD_SERVER_URL." >&2
+  echo "Stop it, or rerun with START_CLOUD=0 to reuse it explicitly." >&2
+  exit 1
+fi
+
+mkdir -p "$CLOUD_DIR/logs"
+if [[ "$START_CLOUD" == "1" ]]; then
+  cloud_cmd=( "$PYTHON_BIN" -m src.speculative_server
+    --dataset "$DATASET"
+    --backend "$CLOUD_BACKEND"
+    --max_sequences "$CLOUD_MAX_SEQUENCES"
+    --ctx_size "$CLOUD_CTX_SIZE"
+    --batch_size "$CLOUD_BATCH_SIZE"
+    --ubatch_size "$CLOUD_UBATCH_SIZE"
+    --batch_wait_ms "$CLOUD_BATCH_WAIT_MS"
+    --batch_request_timeout_s "$SERVER_TIMEOUT_S"
+    --threads "$CLOUD_THREADS"
+    --max_tokens "$CLOUD_MAX_TOKENS"
+    --temp 0
+    --top_k 1
+    --top_p 1
+    --seed "$SEED"
+    --port "$CLOUD_PORT"
+  )
+  if [[ -n "$CLOUD_CPUSET" ]]; then
+    cloud_cmd=( taskset -c "$CLOUD_CPUSET" "${cloud_cmd[@]}" )
+  fi
+  (
+    cd "$CLOUD_DIR"
+    exec "${cloud_cmd[@]}"
+  ) >"$CLOUD_LOG" 2>&1 &
+  CLOUD_PID=$!
+  echo "[cloud] pid=$CLOUD_PID backend=$CLOUD_BACKEND log=$CLOUD_LOG"
+fi
+
+echo "[preflight] waiting for $CLOUD_BACKEND Cloud at $HEALTH_URL"
+cloud_ready=0
+for ((attempt = 0; attempt < CLOUD_START_TIMEOUT_S; attempt++)); do
+  if "$PYTHON_BIN" -c \
+    'import json,sys,urllib.request; d=json.load(urllib.request.urlopen(sys.argv[1], timeout=2)); assert d.get("backend") == sys.argv[2], d' \
+    "$HEALTH_URL" "$CLOUD_BACKEND" >/dev/null 2>&1; then
+    cloud_ready=1
+    break
+  fi
+  if [[ -n "$CLOUD_PID" ]] && ! kill -0 "$CLOUD_PID" 2>/dev/null; then
+    echo "Cloud exited during startup. Last log lines:" >&2
+    tail -n 80 "$CLOUD_LOG" >&2 || true
+    exit 1
+  fi
+  sleep 1
+done
+if [[ "$cloud_ready" != "1" ]]; then
+  echo "Timed out waiting for $CLOUD_BACKEND Cloud at $HEALTH_URL" >&2
+  if [[ -f "$CLOUD_LOG" ]]; then
+    tail -n 80 "$CLOUD_LOG" >&2 || true
+  fi
+  exit 1
+fi
+"$PYTHON_BIN" -c \
+  'import json,sys,urllib.request; d=json.load(urllib.request.urlopen(sys.argv[1], timeout=5)); assert d.get("backend") == sys.argv[2], d; print(json.dumps(d, indent=2))' \
+  "$HEALTH_URL" "$CLOUD_BACKEND"
 
 append_extra_args() {
   local -n arr_ref=$1

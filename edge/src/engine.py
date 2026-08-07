@@ -148,7 +148,7 @@ class Decoding(ABC):
             communication_update_threshold=getattr(self.args, "communication_update_threshold", 0.2),
         )
         # self.exp_name = strategy2exp(self.verify_strategy)
-        self.exp_name = os.path.join(os.getcwd(), 'exp-multi', "exp__wjl", self.args.dataset, self.algorithm)
+        self.exp_name = os.path.join(os.getcwd(), 'exp', "exp__wjl", self.args.dataset, self.algorithm)
         print(self.exp_name)
         os.makedirs(self.exp_name, exist_ok=True)
         # Only the two proactive methods generate while a NAV request is in

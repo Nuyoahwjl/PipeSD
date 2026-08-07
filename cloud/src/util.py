@@ -75,7 +75,7 @@ def parse_arguments():
     parser.add_argument(
         "--backend",
         choices=["batched", "serial"],
-        default="batched",
+        default="serial",
         help="batched uses one llama.cpp context with independent sequence ids",
     )
     parser.add_argument(
