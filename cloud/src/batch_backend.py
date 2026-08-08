@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import random
 import threading
+import uuid
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -26,6 +27,7 @@ class VerifyRequest:
     temp: float = 0.0
     top_k: int = 1
     top_p: float = 1.0
+    prob_transport: str = "full"
 
 
 @dataclass
@@ -35,6 +37,7 @@ class _Session:
     kv_tokens: List[int]
     next_logits: np.ndarray
     pending_final_token: Optional[int] = None
+    pending_rejection: Optional[Dict[str, object]] = None
 
     @property
     def kv_n_past(self) -> int:
@@ -393,6 +396,10 @@ class LlamaCppBatchBackend:
                     raise RuntimeError(f"task {request.task_id} has no batch session")
                 if request.temp != 0.0:
                     raise ValueError("batched backend currently requires temperature 0")
+                if session.pending_rejection is not None:
+                    raise RuntimeError(
+                        f"task {request.task_id} must resolve its pending rejection first"
+                    )
                 if request.n_past != session.logical_n_past:
                     raise RuntimeError(
                         f"task {request.task_id} n_past mismatch: edge={request.n_past}, "
@@ -441,18 +448,30 @@ class LlamaCppBatchBackend:
                     raise RuntimeError("internal logits alignment error")
 
                 target_probs = np.stack([_softmax(row) for row in draft_logits])
-                draft_probs = np.stack(
-                    [np.asarray(row, dtype=np.float64) for row in request.draft_probs]
-                )
-                if draft_probs.shape != target_probs.shape:
-                    raise ValueError(
-                        f"draft probability shape {draft_probs.shape} does not match "
-                        f"target shape {target_probs.shape}"
-                    )
                 draft_tokens = np.asarray(request.tokens, dtype=np.int64)
                 token_rows = np.arange(len(request.tokens))
+                if request.prob_transport == "lazy_distribution":
+                    draft_token_probs = np.asarray(
+                        [float(np.asarray(row)) for row in request.draft_probs],
+                        dtype=np.float64,
+                    )
+                    draft_probs = None
+                elif request.prob_transport == "full":
+                    draft_probs = np.stack(
+                        [np.asarray(row, dtype=np.float64) for row in request.draft_probs]
+                    )
+                    if draft_probs.shape != target_probs.shape:
+                        raise ValueError(
+                            f"draft probability shape {draft_probs.shape} does not match "
+                            f"target shape {target_probs.shape}"
+                        )
+                    draft_token_probs = draft_probs[token_rows, draft_tokens]
+                else:
+                    raise ValueError(
+                        f"unknown probability transport: {request.prob_transport}"
+                    )
                 ratios = target_probs[token_rows, draft_tokens] / (
-                    draft_probs[token_rows, draft_tokens] + 1e-9
+                    draft_token_probs + 1e-9
                 )
                 accepted = 0
                 for index, ratio in enumerate(ratios):
@@ -465,14 +484,27 @@ class LlamaCppBatchBackend:
                         break
 
                 if accepted < len(request.tokens):
-                    final_distribution = _positive_distribution(
-                        target_probs[accepted] - draft_probs[accepted]
-                    )
-                    final_token = int(
-                        np.random.default_rng(request.seed).choice(
-                            final_distribution.size, p=final_distribution
+                    if request.prob_transport == "lazy_distribution":
+                        verification_id = uuid.uuid4().hex
+                        session.pending_rejection = {
+                            "verification_id": verification_id,
+                            "target_probs": target_probs[accepted].copy(),
+                            "draft_token_prob": float(draft_token_probs[accepted]),
+                            "draft_token": int(request.tokens[accepted]),
+                            "n_accepted": accepted,
+                            "n_speculative": len(request.tokens),
+                            "seed": int(request.seed),
+                        }
+                        final_token = None
+                    else:
+                        final_distribution = _positive_distribution(
+                            target_probs[accepted] - draft_probs[accepted]
                         )
-                    )
+                        final_token = int(
+                            np.random.default_rng(request.seed).choice(
+                                final_distribution.size, p=final_distribution
+                            )
+                        )
                 else:
                     final_token = int(np.argmax(output_logits[-1]))
 
@@ -487,8 +519,7 @@ class LlamaCppBatchBackend:
                 if committed_inputs > 0:
                     session.next_logits = output_logits[committed_inputs - 1]
                 session.pending_final_token = final_token
-                results.append(
-                    {
+                result = {
                         "task_id": request.task_id,
                         "n_accepted": accepted,
                         "n_speculative": len(request.tokens),
@@ -497,8 +528,65 @@ class LlamaCppBatchBackend:
                         "evaluated_tokens": len(inputs),
                         "seq_id": session.seq_id,
                     }
-                )
+                if session.pending_rejection is not None:
+                    result.update({
+                        "status": "needs_full_probs",
+                        "verification_id": session.pending_rejection["verification_id"],
+                        "rejected_index": accepted,
+                    })
+                results.append(result)
             return results
+
+    def resolve_rejection(
+        self,
+        task_id: int,
+        verification_id: str,
+        draft_probs: np.ndarray,
+    ) -> Dict[str, object]:
+        with self._lock:
+            session = self._sessions.get(task_id)
+            if session is None:
+                raise RuntimeError(f"task {task_id} has no batch session")
+            pending = session.pending_rejection
+            if pending is None:
+                raise RuntimeError(f"task {task_id} has no pending rejection")
+            if pending["verification_id"] != verification_id:
+                raise RuntimeError("verification_id does not match pending rejection")
+
+            draft_probs = np.asarray(draft_probs, dtype=np.float64).reshape(-1)
+            target_probs = np.asarray(pending["target_probs"], dtype=np.float64)
+            if draft_probs.shape != target_probs.shape:
+                raise ValueError(
+                    f"draft probability shape {draft_probs.shape} does not match "
+                    f"target shape {target_probs.shape}"
+                )
+            token = int(pending["draft_token"])
+            if not np.isclose(
+                draft_probs[token],
+                float(pending["draft_token_prob"]),
+                rtol=1e-5,
+                atol=1e-7,
+            ):
+                raise ValueError("resolved draft probability does not match proposal scalar")
+
+            final_distribution = _positive_distribution(target_probs - draft_probs)
+            final_token = int(
+                np.random.default_rng(int(pending["seed"])).choice(
+                    final_distribution.size, p=final_distribution
+                )
+            )
+            session.pending_final_token = final_token
+            session.pending_rejection = None
+            return {
+                "task_id": task_id,
+                "status": "resolved",
+                "n_accepted": int(pending["n_accepted"]),
+                "n_speculative": int(pending["n_speculative"]),
+                "final_token": final_token,
+                "n_past": session.logical_n_past,
+                "evaluated_tokens": 0,
+                "seq_id": session.seq_id,
+            }
 
     def snapshot(self) -> Dict[str, object]:
         with self._lock:

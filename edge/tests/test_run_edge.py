@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 import concurrent.futures
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -156,6 +157,25 @@ def make_args(**overrides):
 
 
 class RunEdgeTests(unittest.TestCase):
+    def test_probability_transport_defaults_to_original_full_payload(self):
+        decoding = DummyDecoding(make_args())
+        probabilities = [np.array([0.1, 0.7, 0.2], dtype=np.float32)]
+
+        self.assertEqual(decoding.prob_transport, "full")
+        self.assertEqual(
+            decoding._wire_probabilities([1], probabilities),
+            [probabilities[0].tolist()],
+        )
+
+    def test_lazy_probability_transport_sends_only_draft_token_probability(self):
+        decoding = DummyDecoding(make_args(prob_transport="lazy_distribution"))
+        probabilities = [np.array([0.1, 0.7, 0.2], dtype=np.float32)]
+
+        wire = decoding._wire_probabilities([1], probabilities)
+
+        self.assertEqual(len(wire), 1)
+        self.assertAlmostEqual(wire[0], 0.7, places=6)
+
     def test_bayes_latency_trial_does_not_reuse_previous_candidate_tokens(self):
         evaluator = CloudEdgeSpeculativeEval.__new__(CloudEdgeSpeculativeEval)
         evaluator.samples = ["sample"]
@@ -832,6 +852,10 @@ class RunEdgeTests(unittest.TestCase):
             self.assertEqual(engine_module.INIT_ENDPOINT, "http://127.0.0.1:1597/init")
             self.assertEqual(engine_module.START_ENDPOINT, "http://127.0.0.1:1597/start")
             self.assertEqual(engine_module.PROPOSE_ENDPOINT, "http://127.0.0.1:1597/propose")
+            self.assertEqual(
+                engine_module.RESOLVE_ENDPOINT,
+                "http://127.0.0.1:1597/resolve_rejection",
+            )
             self.assertEqual(engine_module.EXIT_ENDPOINT, "http://127.0.0.1:1597/exit")
         finally:
             if previous is None:

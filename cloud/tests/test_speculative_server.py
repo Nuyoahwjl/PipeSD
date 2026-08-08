@@ -178,6 +178,42 @@ def load_module():
 
 
 class CloudServerTaskStateTests(unittest.TestCase):
+    def test_lazy_distribution_finishes_round_only_after_resolve(self):
+        module = load_module()
+        args = module.parse_arguments()
+        module.active_tasks.clear()
+        task = module.InferenceTask(task_id=1, prefix=[1], args=args)
+        task.proc_prefix()
+        module.active_tasks[1] = task
+
+        pending = module.handle_propose_payload({
+            "type": "propose",
+            "task_id": 1,
+            "tokens": [2],
+            "probs": [1.0],
+            "prob_transport": "lazy_distribution",
+            "index": 0,
+            "should_verify": True,
+            "n_past": 1,
+            "speculative_round_id": 0,
+        })
+
+        self.assertEqual(pending['status'], 'needs_full_probs')
+        self.assertNotIn(0, task.completed_verifications)
+        distribution = np.zeros(8, dtype='<f4')
+        distribution[2] = 1.0
+        resolved = module.handle_resolve_rejection_payload({
+            "task_id": 1,
+            "verification_id": pending['verification_id'],
+            "prob_dtype": "float32",
+            "vocab_size": 8,
+            "prob_bytes": distribution.tobytes(),
+        })
+
+        self.assertEqual(resolved['status'], 'resolved')
+        self.assertIn(0, task.completed_verifications)
+        self.assertIsNone(task.pending_rejection)
+
     def test_proc_prefix_measures_only_target_model_eval(self):
         module = load_module()
         args = module.parse_arguments()

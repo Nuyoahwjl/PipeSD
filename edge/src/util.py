@@ -47,6 +47,15 @@ def parse_arguments():
     parser.add_argument('--temp', type=float, default=0, help='temperature for generating new tokens.')
     parser.add_argument('--top_k', type=int, default=1, help='top_k for ungreedy sampling strategy.')
     parser.add_argument('--top_p', type=float, default=0.95, help='top_p for ungreedy sampling strategy.')
+    parser.add_argument(
+        '--prob_transport',
+        choices=['full', 'lazy_distribution'],
+        default='full',
+        help=(
+            'full preserves the original protocol; lazy_distribution sends only '
+            'q(draft_token) and uploads one full distribution after a rejection.'
+        ),
+    )
     parser.add_argument('--gamma', type=int, default=6, help='guess time.')
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--ctx_size", type=int, default=16384)

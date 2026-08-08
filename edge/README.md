@@ -35,6 +35,9 @@ Common arguments (see `src/util.py` for the full list):
 - `--algorithm`: `vanilla`, `edgeLLM`, `hsl`, `pipesd`
 - `--verify_strategy`: `fixed-num`, `single-token`, `multiple-tokens`, `hybrid`
 - `--bandwidth_MBps`: network bandwidth limit used by the sender
+- `--prob_transport`: `full` (the unchanged default) or `lazy_distribution`.
+  Lazy mode sends only the probability of each draft token and uploads one
+  float32 vocabulary distribution if that token is rejected.
 
 Upload behavior is algorithm-specific: Vanilla/HSL upload the complete draft
 once at NAV; EdgeLLM uploads proactively only while NAV is pending, in the
@@ -52,6 +55,17 @@ Example (from `edge/`):
 ```bash
 bash scripts/sweep.sh
 ```
+
+To compare the original PipeSD probability upload against lazy distribution
+transfer on HumanEval with identical thresholds and network settings:
+
+```bash
+bash scripts/compare_lazy_distribution_humaneval.sh
+```
+
+Use `TARGET_OUTPUT_TOKENS=100` for a pilot. The default is the 1000-token paper
+protocol. The comparison starts the serial cloud backend by default; use
+`START_CLOUD=0` only when explicitly reusing an already-running server.
 
 ## Outputs
 Results are written under `edge/exp/` as JSON (one entry per run).

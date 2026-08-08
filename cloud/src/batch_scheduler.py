@@ -100,6 +100,11 @@ class VerificationBatchScheduler:
     def submit(self, request: VerifyRequest):
         return self._enqueue_and_wait(_WorkItem("verify", request.task_id, request))
 
+    def resolve_rejection(self, task_id: int, verification_id: str, draft_probs):
+        return self._enqueue_and_wait(
+            _WorkItem("resolve", task_id, (verification_id, draft_probs))
+        )
+
     def close_session(self, task_id: int) -> None:
         self._enqueue_and_wait(_WorkItem("close", task_id))
 
@@ -192,6 +197,11 @@ class VerificationBatchScheduler:
             if item.kind == "close":
                 self.backend.close_session(item.task_id)
                 result = None
+            elif item.kind == "resolve":
+                verification_id, draft_probs = item.payload
+                result = self.backend.resolve_rejection(
+                    item.task_id, verification_id, draft_probs
+                )
             else:
                 raise RuntimeError(f"unknown batch work item: {item.kind}")
             self._finish(item, result=result)

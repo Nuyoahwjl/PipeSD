@@ -47,6 +47,10 @@ class FakeBatchBackend:
     def close_session(self, task_id):
         return None
 
+    def resolve_rejection(self, task_id, verification_id, draft_probs):
+        self.calls.append(["resolve", task_id, verification_id, len(draft_probs)])
+        return {'task_id': task_id, 'status': 'resolved', 'final_token': 9}
+
     def close(self):
         self.closed = True
 
@@ -55,6 +59,16 @@ class FakeBatchBackend:
 
 
 class VerificationBatchSchedulerTests(unittest.TestCase):
+    def test_resolve_rejection_is_serialized_through_worker(self):
+        backend = FakeBatchBackend()
+        scheduler = VerificationBatchScheduler(backend, batch_wait_ms=0)
+
+        result = scheduler.resolve_rejection(3, "verify-1", [0.1, 0.9])
+
+        self.assertEqual(result['status'], 'resolved')
+        self.assertIn(["resolve", 3, "verify-1", 2], backend.calls)
+        scheduler.shutdown()
+
     def test_concurrent_prefills_share_multi_sequence_decode_work(self):
         backend = FakeBatchBackend()
         scheduler = VerificationBatchScheduler(backend, batch_wait_ms=50)

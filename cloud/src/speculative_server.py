@@ -10,6 +10,7 @@ import json
 import os
 import logging
 import threading
+import uuid
 import torch
 from contextlib import nullcontext
 from src.util import seed_everything, parse_arguments, softmax, max_fn, sample, GPUEnergyMonitor, EnergyTracker
@@ -153,6 +154,8 @@ class InferenceTask:
         # 存储累积的推测token和概率
         self.accumulated_tokens = []
         self.accumulated_probs = []
+        self.prob_transport = 'full'
+        self.pending_rejection = None
         self.gamma = args.gamma if hasattr(args, 'gamma') else 4
         self.max_len = args.max_tokens if hasattr(args, 'max_tokens') else 512
         self.top_k = args.top_k if hasattr(args, 'top_k') else 1
@@ -351,11 +354,13 @@ class InferenceTask:
             'expected_prefix_token': expected_prefix_token,
             'round_id': round_id,
             'prefix_version': payload.get('prefix_version'),
+            'prob_transport': payload.get('prob_transport', 'full'),
         })
         if (
             entry['expected_prefix_token'] != expected_prefix_token
             or entry['round_id'] != round_id
             or entry['prefix_version'] != payload.get('prefix_version')
+            or entry['prob_transport'] != payload.get('prob_transport', 'full')
         ):
             return parent_round_id, False
         added_contiguously = self._add_indexed(
@@ -403,6 +408,7 @@ class InferenceTask:
             return 0
         self.accumulated_tokens = list(entry['tokens'])
         self.accumulated_probs = list(entry['probs'])
+        self.prob_transport = entry.get('prob_transport', 'full')
         count = len([token for token in self.accumulated_tokens if token is not None])
         self.reused_proactive_tokens += count
         self.promoted_parent_rounds.add(parent_round_id)
@@ -438,10 +444,24 @@ class InferenceTask:
                 return {'n_accepted': 0, 'n_speculative': 0, 'final_token': None, 'n_past': n_past_at_verify}
             
             speculative_tokens = valid_tokens 
-            draft_probs = np.stack(valid_probs)  # 假设所有probs形状相同
+            prob_transport = self.prob_transport
+            if prob_transport == 'lazy_distribution':
+                draft_token_probs = np.asarray(
+                    [float(np.asarray(probability)) for probability in valid_probs],
+                    dtype=np.float64,
+                )
+                draft_probs = None
+            elif prob_transport == 'full':
+                draft_probs = np.stack(valid_probs)  # 假设所有probs形状相同
+            else:
+                raise ValueError(f"unknown probability transport: {prob_transport}")
             n_speculative = len(speculative_tokens)
             logger.info(f"task={self.task_id} n_speculative={n_speculative} speculative_tokens={self.target_model.detokenize(speculative_tokens).decode('utf-8', 'ignore')}")
-            logger.info(f"task={self.task_id} draft_probs_shape={draft_probs.shape}")
+            logger.info(
+                "task=%s draft_probability_transport=%s",
+                self.task_id,
+                prob_transport,
+            )
             
             if self.final_token is not None:
                 final_len = 1
@@ -465,7 +485,10 @@ class InferenceTask:
             # 向量化计算概率比值
             EPSILON = 1e-9
             target_token_probs = target_probs[np.arange(n_speculative), speculative_tokens]
-            draft_token_probs = draft_probs[np.arange(n_speculative), speculative_tokens]
+            if prob_transport == 'full':
+                draft_token_probs = draft_probs[
+                    np.arange(n_speculative), speculative_tokens
+                ]
             p_ratios = target_token_probs / (draft_token_probs + EPSILON)
             # p_ratios = np.round(p_ratios, decimals=2)
             logger.info(f"task={self.task_id} scores={target_scores[np.arange(n_speculative), speculative_tokens].tolist()}")
@@ -495,16 +518,29 @@ class InferenceTask:
             
             # 计算最终token
             if n_accepted < n_speculative:
-                diff_probs = target_probs[n_accepted] - draft_probs[n_accepted]
-                logger.info(f"task={self.task_id} n_accepted={n_accepted} computing final_token from diff_probs")
-                try:
-                    seed_for_sample = self.args.seed if hasattr(self.args, 'seed') else None
-                except Exception:
-                    seed_for_sample = None
-                logger.info(f"task={self.task_id} sample_seed={seed_for_sample}")
-                # 为最终 token 的位置生成并记录一个随机数键（与 verify 相同位置规则）
-                final_token = sample(max_fn(diff_probs), 1, seed=seed_for_sample)
-                logger.info(f"task={self.task_id} sampled final_token={final_token}")
+                if prob_transport == 'lazy_distribution':
+                    verification_id = uuid.uuid4().hex
+                    self.pending_rejection = {
+                        'verification_id': verification_id,
+                        'target_probs': target_probs[n_accepted].copy(),
+                        'draft_token_prob': float(draft_token_probs[n_accepted]),
+                        'draft_token': int(speculative_tokens[n_accepted]),
+                        'n_accepted': n_accepted,
+                        'n_speculative': n_speculative,
+                        'accepted_n_past': n_past_at_verify + n_accepted,
+                    }
+                    final_token = None
+                else:
+                    diff_probs = target_probs[n_accepted] - draft_probs[n_accepted]
+                    logger.info(f"task={self.task_id} n_accepted={n_accepted} computing final_token from diff_probs")
+                    try:
+                        seed_for_sample = self.args.seed if hasattr(self.args, 'seed') else None
+                    except Exception:
+                        seed_for_sample = None
+                    logger.info(f"task={self.task_id} sample_seed={seed_for_sample}")
+                    # 为最终 token 的位置生成并记录一个随机数键（与 verify 相同位置规则）
+                    final_token = sample(max_fn(diff_probs), 1, seed=seed_for_sample)
+                    logger.info(f"task={self.task_id} sampled final_token={final_token}")
             else:
                 # Use shared_model wrapper to log internal model sampling behavior
                 try:
@@ -519,11 +555,22 @@ class InferenceTask:
                     logger.info(f"task={self.task_id} used model.sample (direct fallback) final_token={final_token}")
             
             # 更新并返回
-            new_n_past = self.target_model.n_tokens + 1
+            new_n_past = self.target_model.n_tokens + (1 if final_token is not None else 0)
             self.final_token = final_token
             self.reset_accumulated()
             logger.info(f"verify_tokens end: task={self.task_id} n_accepted={n_accepted} n_speculative={n_speculative} final_token={final_token} new_n_past={new_n_past}")
 
+            if self.pending_rejection is not None:
+                return {
+                    'status': 'needs_full_probs',
+                    'verification_id': self.pending_rejection['verification_id'],
+                    'rejected_index': n_accepted,
+                    'n_accepted': n_accepted,
+                    'n_speculative': n_speculative,
+                    'final_token': None,
+                    'n_past': new_n_past,
+                    'gpu_power_integral': getattr(self, 'last_verify_power_integral', 0.0),
+                }
             if n_accepted == n_speculative:
                 self.last_verify_pass = True
             else:
@@ -539,6 +586,45 @@ class InferenceTask:
                 'cache_version': self.cache_version,
                 'gpu_power_integral': getattr(self, 'last_verify_power_integral', 0.0)
             }
+
+    def resolve_rejection(self, verification_id: str, draft_probs):
+        pending = self.pending_rejection
+        if pending is None:
+            raise ValueError("task has no pending rejection")
+        if pending['verification_id'] != verification_id:
+            raise ValueError("verification_id does not match pending rejection")
+        draft_probs = np.asarray(draft_probs, dtype=np.float64).reshape(-1)
+        target_probs = np.asarray(pending['target_probs'], dtype=np.float64)
+        if draft_probs.shape != target_probs.shape:
+            raise ValueError(
+                f"draft probability shape {draft_probs.shape} does not match "
+                f"target shape {target_probs.shape}"
+            )
+        token = int(pending['draft_token'])
+        if not np.isclose(
+            draft_probs[token],
+            float(pending['draft_token_prob']),
+            rtol=1e-5,
+            atol=1e-7,
+        ):
+            raise ValueError("resolved draft probability does not match proposal scalar")
+        seed_for_sample = self.args.seed if hasattr(self.args, 'seed') else None
+        final_token = sample(
+            max_fn(target_probs - draft_probs), 1, seed=seed_for_sample
+        )
+        self.final_token = final_token
+        self.pending_rejection = None
+        self.last_verify_pass = False
+        self.cache_version += 1
+        return {
+            'status': 'resolved',
+            'n_accepted': int(pending['n_accepted']),
+            'n_speculative': int(pending['n_speculative']),
+            'final_token': int(final_token),
+            'n_past': int(pending['accepted_n_past']) + 1,
+            'cache_version': self.cache_version,
+            'gpu_power_integral': getattr(self, 'last_verify_power_integral', 0.0),
+        }
     
     def reset_accumulated(self):
         """重置累积的数据"""
@@ -557,6 +643,50 @@ def _runtime_args():
 
 def _batch_enabled():
     return batch_scheduler is not None
+
+
+def _finalize_verification(task, round_id, result):
+    """Commit a completed NAV result and release/discard proactive work."""
+    task.completed_verifications[round_id] = dict(result)
+    task.last_completed_round_id = round_id
+    task.last_verify_pass = (
+        result.get('n_accepted') == result.get('n_speculative')
+    )
+    task.final_token = result.get('final_token')
+    proactive_entry = task.proactive_buffers.get(round_id)
+    if proactive_entry is None:
+        return
+    status = task.proactive_parent_status(
+        round_id, proactive_entry.get('expected_prefix_token')
+    )
+    if status == 'pending':
+        all_accepted = result.get('n_accepted') == result.get('n_speculative')
+        prefix_matches = (
+            proactive_entry.get('expected_prefix_token') is not None
+            and result.get('final_token') is not None
+            and int(proactive_entry['expected_prefix_token'])
+            == int(result['final_token'])
+        )
+        status = 'valid' if all_accepted and prefix_matches else 'invalid'
+    if status == 'valid':
+        task.promote_proactive_buffer(round_id)
+    else:
+        task.discard_proactive_buffer(round_id)
+
+
+def _decode_residual_distribution(payload):
+    if payload.get('prob_dtype') != 'float32':
+        raise ValueError("lazy residual probability dtype must be float32")
+    vocab_size = int(payload.get('vocab_size', 0))
+    raw = payload.get('prob_bytes')
+    if vocab_size <= 0 or not isinstance(raw, (bytes, bytearray)):
+        raise ValueError("lazy residual payload is missing probability bytes")
+    probabilities = np.frombuffer(raw, dtype='<f4')
+    if probabilities.size != vocab_size:
+        raise ValueError(
+            f"lazy residual has {probabilities.size} values, expected {vocab_size}"
+        )
+    return probabilities.copy()
 
 
 def handle_init_request(request: InitRequest):
@@ -629,6 +759,9 @@ def handle_propose_payload(payload):
 
     tokens = payload.get('tokens', [])
     probs = payload.get('probs', [])
+    prob_transport = payload.get('prob_transport', 'full')
+    if prob_transport not in {'full', 'lazy_distribution'}:
+        raise HTTPException(status_code=400, detail="Unknown probability transport.")
     should_verify = payload.get('should_verify', False)
     n_past_at_receive = payload.get('n_past', task.n_past)
 
@@ -730,6 +863,7 @@ def handle_propose_payload(payload):
             'index', len([t for t in task.accumulated_tokens if t is not None])
         )
         if not is_proactive:
+            task.prob_transport = prob_transport
             task.add_batch(tokens, probs, index)
         if not should_verify:
             return {
@@ -747,6 +881,7 @@ def handle_propose_payload(payload):
         task.active_verify_round_id = int(round_id) if round_id is not None else task.cache_version
         active_round_id = task.active_verify_round_id
         if _batch_enabled():
+            verify_prob_transport = task.prob_transport
             verify_tokens = [
                 int(token) for token in task.accumulated_tokens if token is not None
             ]
@@ -775,11 +910,13 @@ def handle_propose_payload(payload):
                 temp=float(task.temp),
                 top_k=int(task.top_k),
                 top_p=float(task.top_p),
+                prob_transport=verify_prob_transport,
             )
             result = batch_scheduler.submit(request)
             task.n_past = int(result['n_past'])
-            task.cache_version += 1
-            result['cache_version'] = task.cache_version
+            if result.get('status') != 'needs_full_probs':
+                task.cache_version += 1
+                result['cache_version'] = task.cache_version
             task.veridy_num += 1
             nav_energy = task.record_energy_measurement(
                 stage='verify_total',
@@ -825,37 +962,64 @@ def handle_propose_payload(payload):
                 if nav_energy is not None:
                     result['gpu_power_integral'] = nav_energy['energy_joules']
                     result['nav_energy_measurement'] = nav_energy
+        if result.get('status') == 'needs_full_probs':
+            if task.pending_rejection is None:
+                task.pending_rejection = {
+                    'verification_id': result['verification_id'],
+                }
+            task.pending_rejection['round_id'] = int(active_round_id)
     finally:
         with task.verify_condition:
-            if 'result' in locals():
-                task.completed_verifications[active_round_id] = dict(result)
-                task.last_completed_round_id = active_round_id
-                task.last_verify_pass = (
-                    result.get('n_accepted') == result.get('n_speculative')
-                )
-                task.final_token = result.get('final_token')
-                proactive_entry = task.proactive_buffers.get(active_round_id)
-                if proactive_entry is not None:
-                    status = task.proactive_parent_status(
-                        active_round_id, proactive_entry.get('expected_prefix_token')
-                    )
-                    # Temporarily clear the in-progress flag so status consults
-                    # the completed result just recorded above.
-                    if status == 'pending':
-                        all_accepted = result.get('n_accepted') == result.get('n_speculative')
-                        prefix_matches = (
-                            proactive_entry.get('expected_prefix_token') is not None
-                            and result.get('final_token') is not None
-                            and int(proactive_entry['expected_prefix_token']) == int(result['final_token'])
-                        )
-                        status = 'valid' if all_accepted and prefix_matches else 'invalid'
-                    if status == 'valid':
-                        task.promote_proactive_buffer(active_round_id)
-                    else:
-                        task.discard_proactive_buffer(active_round_id)
+            if (
+                'result' in locals()
+                and result.get('status') != 'needs_full_probs'
+            ):
+                _finalize_verification(task, active_round_id, result)
             task.verify_in_progress = False
             task.active_verify_round_id = None
             task.verify_condition.notify_all()
+    return result
+
+
+def handle_resolve_rejection_payload(payload):
+    task_id = payload.get('task_id')
+    verification_id = payload.get('verification_id')
+    with active_tasks_lock:
+        task = active_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=400, detail="Task not found or not initialized.")
+    try:
+        draft_probs = _decode_residual_distribution(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    with task.verify_condition:
+        pending = task.pending_rejection
+        if _batch_enabled():
+            # The backend owns the target row in batched mode.  The task keeps
+            # only the round identity needed by the HTTP/proactive state machine.
+            pending = getattr(task, 'pending_rejection', None)
+        if pending is None:
+            raise HTTPException(status_code=409, detail="Task has no pending rejection.")
+        round_id = int(pending['round_id'])
+
+    try:
+        if _batch_enabled():
+            result = batch_scheduler.resolve_rejection(
+                int(task_id), str(verification_id), draft_probs
+            )
+            task.cache_version += 1
+            result['cache_version'] = task.cache_version
+        else:
+            result = task.resolve_rejection(str(verification_id), draft_probs)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    with task.verify_condition:
+        task.pending_rejection = None
+        task.n_past = int(result['n_past'])
+        _finalize_verification(task, round_id, result)
+        task.verify_condition.notify_all()
     return result
 
 
@@ -977,6 +1141,21 @@ async def propose(request: Request):
     from anyio.to_thread import run_sync
 
     return await run_sync(handle_propose_payload, payload)
+
+
+@app.post("/resolve_rejection")
+async def resolve_rejection(request: Request):
+    raw_body = await request.body()
+    try:
+        payload = msgpack.unpackb(raw_body, raw=False)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid msgpack data: {str(exc)}"
+        ) from exc
+
+    from anyio.to_thread import run_sync
+
+    return await run_sync(handle_resolve_rejection_payload, payload)
 
 @app.post("/exit")
 async def exit_task(request: Request):

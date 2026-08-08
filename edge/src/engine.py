@@ -35,6 +35,7 @@ URL = resolve_server_url()
 INIT_ENDPOINT = f"{URL}/init"
 START_ENDPOINT = f"{URL}/start"
 PROPOSE_ENDPOINT = f"{URL}/propose"
+RESOLVE_ENDPOINT = f"{URL}/resolve_rejection"
 EXIT_ENDPOINT = f"{URL}/exit"
 DELAY_ENDPOINT = f"{URL}/delay"
 
@@ -83,6 +84,7 @@ class Decoding(ABC):
         self.top_k: int = getattr(args, 'top_k', 40)
         self.top_p: float = getattr(args, 'top_p', 0.95)
         self.temp: float = getattr(args, 'temp', 0)
+        self.prob_transport: str = getattr(args, 'prob_transport', 'full')
         self.C: float = getattr(args, 'C', 0.05)
         self.verify_strategy: str = getattr(args, 'verify_strategy', "fixed-num")
         self.verify_num: int = getattr(args, 'verify_num', 8)
@@ -175,6 +177,8 @@ class Decoding(ABC):
         self.batch_trace = []
         self.edge_llm_threshold_trace = []
         self._speculative_round_id = 0
+        self.lazy_resolve_requests = 0
+        self.lazy_residual_distribution_bytes = 0
 
         self.verify_thresh_single = self.args.verify_thresh_single
         self.verify_thresh_multi = self.args.verify_thresh_multi
@@ -266,14 +270,21 @@ class Decoding(ABC):
                 return
 
             vocab_size = int(getattr(self.args, 'vocab_size', 32000))
-            probe_probs = [0.0] * vocab_size
+            probe_probability = (
+                0.0
+                if self.prob_transport == 'lazy_distribution'
+                else [0.0] * vocab_size
+            )
             for batch_size in missing_sizes:
-                payload = msgpack.packb({
+                probe_payload = {
                     'type': 'communication_probe',
                     'tokens': [0] * batch_size,
-                    'probs': [probe_probs] * batch_size,
+                    'probs': [probe_probability] * batch_size,
                     'token_count': batch_size,
-                })
+                }
+                if self.prob_transport == 'lazy_distribution':
+                    probe_payload['prob_transport'] = 'lazy_distribution'
+                payload = msgpack.packb(probe_payload)
                 future = self.sender.submit(
                     DELAY_ENDPOINT,
                     payload,
@@ -377,6 +388,66 @@ class Decoding(ABC):
         self._spec_token_indices_sent.update(new_indices)
         self.num_spec_tokens_sent += len(new_indices)
         return len(new_indices)
+
+    def _wire_probabilities(
+        self,
+        tokens: List[int],
+        probabilities: List[np.ndarray],
+    ):
+        """Serialize draft probabilities without changing the default protocol."""
+        if self.prob_transport == 'full':
+            return [np.asarray(probability).tolist() for probability in probabilities]
+        return [
+            float(np.asarray(probability)[int(token)])
+            for token, probability in zip(tokens, probabilities)
+        ]
+
+    def _apply_probability_transport(self, payload: Dict[str, object]) -> None:
+        # Omit the field in full mode so the default wire format stays backward
+        # compatible with older cloud servers and recorded baselines.
+        if self.prob_transport == 'lazy_distribution':
+            payload['prob_transport'] = 'lazy_distribution'
+
+    def _resolve_lazy_rejection(
+        self,
+        *,
+        task_id: int,
+        result: Dict[str, object],
+        round_probabilities: List[np.ndarray],
+        sender: BandwidthSender,
+    ) -> Dict[str, object]:
+        if result.get('status') != 'needs_full_probs':
+            return result
+        rejected_index = int(result['rejected_index'])
+        if rejected_index < 0 or rejected_index >= len(round_probabilities):
+            raise RuntimeError(
+                f"cloud requested invalid rejected_index={rejected_index} "
+                f"for {len(round_probabilities)} draft distributions"
+            )
+        distribution = np.asarray(
+            round_probabilities[rejected_index], dtype='<f4'
+        ).reshape(-1)
+        distribution_bytes = distribution.tobytes(order='C')
+        resolve_payload = msgpack.packb({
+            'type': 'resolve_rejection',
+            'task_id': task_id,
+            'verification_id': result['verification_id'],
+            'prob_dtype': 'float32',
+            'vocab_size': int(distribution.size),
+            'prob_bytes': distribution_bytes,
+        })
+        self.lazy_resolve_requests += 1
+        self.lazy_residual_distribution_bytes += len(distribution_bytes)
+        resolved = sender.submit(
+            RESOLVE_ENDPOINT,
+            resolve_payload,
+            headers={"Content-Type": "application/msgpack"},
+            token_count=1,
+            measurement_kind="lazy_residual",
+        ).result()
+        if not isinstance(resolved, dict) or resolved.get('status') == 'needs_full_probs':
+            raise RuntimeError(f"invalid lazy rejection resolution: {resolved}")
+        return resolved
 
     def _trace_batch(self, *, phase: str, batch_size: int, planned_size: int,
                      plan_index: int, window_id: int, batch_id: int,
@@ -857,7 +928,9 @@ class Decoding(ABC):
                 payload = {
                     'type': 'propose',
                     'tokens': current_batch_tokens.copy(),
-                    'probs': [p.tolist() for p in current_batch_probs],
+                    'probs': self._wire_probabilities(
+                        current_batch_tokens, current_batch_probs
+                    ),
                     'task_id': task_id,
                     'n_past': current_n_past,  # 使用当前的n_past
                     'index': len(total_speculative_tokens) - len(current_batch_tokens),  # 本次验证的索引（从0开始）
@@ -869,6 +942,7 @@ class Decoding(ABC):
                     'token_count': len(current_batch_tokens),
                     'prefix_version': current_n_past,
                 }
+                self._apply_probability_transport(payload)
                 payload_bytes = msgpack.packb(payload)
                 # 将本轮所有推测token的索引计入“已验证”集合（避免重复计数）
                 self._mark_sent(total_speculative_indices)
@@ -985,7 +1059,12 @@ class Decoding(ABC):
                     should_verify_waiting = should_verify_waiting or wait_token == self.draft_model.token_eos()
 
                     if future.done():
-                        verify_result = future.result()
+                        verify_result = self._resolve_lazy_rejection(
+                            task_id=task_id,
+                            result=future.result(),
+                            round_probabilities=total_speculative_probs,
+                            sender=self.sender,
+                        )
                         if 'error' in verify_result or 'n_accepted' not in verify_result or 'final_token' not in verify_result:
                             print(f"[Edge] 服务器返回错误: {verify_result}")
                             return
@@ -1009,7 +1088,9 @@ class Decoding(ABC):
                         waiting_payload = {
                             'type': 'propose_waiting',
                             'tokens': waiting_batch_tokens,
-                            'probs': [p.tolist() for p in waiting_batch_probs],
+                            'probs': self._wire_probabilities(
+                                waiting_batch_tokens, waiting_batch_probs
+                            ),
                             'task_id': task_id,
                             'n_past': current_n_past + len(total_speculative_tokens) + 1,
                             'index': waiting_start_index,
@@ -1023,6 +1104,7 @@ class Decoding(ABC):
                             'expected_prefix_token': speculated_final_token,
                             'parent_round_id': nav_round_id,
                         }
+                        self._apply_probability_transport(waiting_payload)
                         waiting_payload_bytes = msgpack.packb(waiting_payload)
                         self._mark_sent(waiting_batch_indices)
                         flush_reason = None
@@ -1066,7 +1148,12 @@ class Decoding(ABC):
                         break
                 
                 if verify_result is None:
-                    verify_result = future.result()
+                    verify_result = self._resolve_lazy_rejection(
+                        task_id=task_id,
+                        result=future.result(),
+                        round_probabilities=total_speculative_probs,
+                        sender=self.sender,
+                    )
                 
                 # 检查响应是否包含错误信息
                 if 'error' in verify_result or 'n_accepted' not in verify_result:
@@ -1145,7 +1232,12 @@ class Decoding(ABC):
                         if should_verify_waiting:
                             if waiting_verify_future is None:
                                 raise RuntimeError("waiting NAV was requested without a flushed verification batch")
-                            verify_result_waiting = waiting_verify_future.result()
+                            verify_result_waiting = self._resolve_lazy_rejection(
+                                task_id=task_id,
+                                result=waiting_verify_future.result(),
+                                round_probabilities=waiting_probs,
+                                sender=self.proactive_sender,
+                            )
                             if 'n_accepted' not in verify_result_waiting:
                                 if self._is_discarded_proactive_response(verify_result_waiting):
                                     self.color_print(
@@ -1249,7 +1341,9 @@ class Decoding(ABC):
                 payload = {
                     'type': 'propose',
                     'tokens': current_batch_tokens.copy(),
-                    'probs': [p.tolist() for p in current_batch_probs],
+                    'probs': self._wire_probabilities(
+                        current_batch_tokens, current_batch_probs
+                    ),
                     'task_id': task_id,
                     'n_past': current_n_past,  # 使用当前的n_past
                     'index': len(total_speculative_tokens) - len(current_batch_tokens),  # 当前批次的索引
@@ -1261,6 +1355,7 @@ class Decoding(ABC):
                     'token_count': len(current_batch_tokens),
                     'prefix_version': current_n_past,
                 }
+                self._apply_probability_transport(payload)
                 payload_bytes = msgpack.packb(payload)
 
                 # print(f"[DEBUG] 发送批次请求，tokens: {current_batch_tokens}, n_past: {current_n_past}, index: {len(total_speculative_tokens)}， tokens: {self.draft_model.detokenize(total_speculative_tokens).decode('utf-8', 'ignore')}")
@@ -1389,11 +1484,16 @@ class Decoding(ABC):
                 and output_tokens[-1] != self.draft_model.token_eos()
             ),
             'strategy': self.verify_strategy,
+            'prob_transport': self.prob_transport,
             'merge_policy': self.merge_policy,
             'bandwidth_MBps': self.bandwidth_MBps,
             'thresh_single': self.verify_thresh_single,
             'thresh_multi': self.verify_thresh_multi,
             'verify_stats': verify_stats,
+            'lazy_distribution': {
+                'resolve_requests': self.lazy_resolve_requests,
+                'residual_distribution_bytes': self.lazy_residual_distribution_bytes,
+            },
             'token_durations': list(self._sample_token_durations),
             'time_to_first_token_seconds': self._first_accepted_token_latency,
             'avg_token_time': avg_token_time,

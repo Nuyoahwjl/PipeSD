@@ -70,6 +70,66 @@ class LlamaCppBatchBackendStateTests(unittest.TestCase):
         self.assertIsNotNone(backend._sessions[12].pending_final_token)
         self.assertEqual(backend.removals, [(1, 1, -1)])
 
+    def test_lazy_rejection_is_resolved_with_one_full_distribution(self):
+        backend = self.make_backend()
+        backend._sessions[13] = _Session(
+            task_id=13,
+            seq_id=1,
+            kv_tokens=[9],
+            next_logits=np.zeros(4),
+        )
+        backend._decode_rows = lambda rows: [np.zeros(4) for _ in rows]
+
+        pending = backend.verify_batch([
+            VerifyRequest(
+                13,
+                1,
+                [1],
+                [1.0],
+                seed=1,
+                prob_transport="lazy_distribution",
+            )
+        ])[0]
+
+        self.assertEqual(pending['status'], 'needs_full_probs')
+        self.assertEqual(pending['rejected_index'], 0)
+        self.assertIsNone(backend._sessions[13].pending_final_token)
+        self.assertIsNotNone(backend._sessions[13].pending_rejection)
+
+        resolved = backend.resolve_rejection(
+            13,
+            pending['verification_id'],
+            np.array([0.0, 1.0, 0.0, 0.0]),
+        )
+
+        self.assertEqual(resolved['status'], 'resolved')
+        self.assertEqual(resolved['n_accepted'], 0)
+        self.assertIsNotNone(resolved['final_token'])
+        self.assertIsNone(backend._sessions[13].pending_rejection)
+        self.assertEqual(
+            backend._sessions[13].pending_final_token,
+            resolved['final_token'],
+        )
+
+        baseline = self.make_backend()
+        baseline._sessions[13] = _Session(
+            task_id=13,
+            seq_id=1,
+            kv_tokens=[9],
+            next_logits=np.zeros(4),
+        )
+        baseline._decode_rows = lambda rows: [np.zeros(4) for _ in rows]
+        full = baseline.verify_batch([
+            VerifyRequest(
+                13,
+                1,
+                [1],
+                [np.array([0.0, 1.0, 0.0, 0.0])],
+                seed=1,
+            )
+        ])[0]
+        self.assertEqual(resolved['final_token'], full['final_token'])
+
     def test_prefill_interleaves_independent_sequence_ids(self):
         backend = self.make_backend()
         backend.decode_batch_tokens = 4
