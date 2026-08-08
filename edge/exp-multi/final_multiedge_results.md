@@ -30,6 +30,7 @@ $$
 =\frac{\sum_i\text{sample total time}_i}
 {\sum_i\text{sample output tokens}_i}\times1000
 $$
+
 User-weighted TPT 表示客户端实际经历的加权平均每 output token 时间。它与多客户端系统吞吐倒数不同。
 
 
