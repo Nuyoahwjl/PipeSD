@@ -135,6 +135,24 @@ def parse_arguments():
     parser.add_argument('--communication_update_threshold', type=float, default=0.2, help='Communication alpha/beta relative-change threshold delta3.')
     parser.add_argument('--regression_min_comm_samples', type=int, default=8, help='Minimum communication samples before alpha/beta regression.')
     parser.add_argument(
+        '--lazy_comm_probe_sizes',
+        type=str,
+        default='1,4,16,64,256,1024,2048,4096',
+        help='Comma-separated scalar-probability probe sizes used only by lazy_distribution.',
+    )
+    parser.add_argument(
+        '--lazy_comm_probe_repetitions',
+        type=int,
+        default=3,
+        help='Measurements per lazy communication probe size; medians reduce HTTP jitter.',
+    )
+    parser.add_argument(
+        '--lazy_comm_min_r_squared',
+        type=float,
+        default=0.8,
+        help='Minimum payload-byte regression R2 required before lazy alpha/beta update.',
+    )
+    parser.add_argument(
         '--disable_online_environment_measurement',
         action='store_true',
         help='Disable online alpha/beta/gamma measurement updates for DP scheduling.',

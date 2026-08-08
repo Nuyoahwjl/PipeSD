@@ -38,6 +38,11 @@ Common arguments (see `src/util.py` for the full list):
 - `--prob_transport`: `full` (the unchanged default) or `lazy_distribution`.
   Lazy mode sends only the probability of each draft token and uploads one
   float32 vocabulary distribution if that token is rejected.
+- Lazy DP communication calibration is payload-aware. It probes scalar batches
+  of `1,4,16,64,256,1024,2048,4096` tokens three times, aggregates medians,
+  and requires regression `R2 >= 0.8` before replacing alpha/beta. Override
+  these safeguards with `--lazy_comm_probe_sizes`,
+  `--lazy_comm_probe_repetitions`, and `--lazy_comm_min_r_squared`.
 
 Upload behavior is algorithm-specific: Vanilla/HSL upload the complete draft
 once at NAV; EdgeLLM uploads proactively only while NAV is pending, in the

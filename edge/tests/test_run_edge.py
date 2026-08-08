@@ -84,6 +84,7 @@ class BootstrapSender(FakeSender):
                 "token_count": token_count,
                 "measurement_kind": measurement_kind,
                 "elapsed_seconds": 0.05 + 0.01 * token_count,
+                "payload_size": 80 + 12 * token_count,
             })
         future = concurrent.futures.Future()
         future.set_result({"body_size_bytes": len(payload)})
@@ -146,6 +147,9 @@ def make_args(**overrides):
         schedule_history_size=100,
         environment_update_threshold=0.2,
         regression_min_comm_samples=8,
+        lazy_comm_probe_sizes="1,4,16,64,256,1024,2048,4096",
+        lazy_comm_probe_repetitions=3,
+        lazy_comm_min_r_squared=0.8,
         disable_online_environment_measurement=False,
         merge_policy="dp",
         result_tag="",
@@ -659,6 +663,37 @@ class RunEdgeTests(unittest.TestCase):
         estimates = decoder.environment_estimator.estimate()
         self.assertAlmostEqual(estimates["alpha"], 0.05, places=6)
         self.assertAlmostEqual(estimates["beta"], 0.01, places=6)
+
+    def test_lazy_pipesd_uses_repeated_wide_payload_aware_probes(self):
+        args = make_args(
+            algorithm="pipesd",
+            verify_strategy="hybrid",
+            prob_transport="lazy_distribution",
+            regression_min_comm_samples=4,
+            lazy_comm_probe_sizes="1,4,16,64",
+            lazy_comm_probe_repetitions=2,
+            lazy_comm_min_r_squared=0.99,
+        )
+        decoder = DummyDecoding(args)
+        decoder.color_print = lambda *args, **kwargs: None
+
+        with mock.patch("src.engine.Llama", FakeLlama), mock.patch(
+            "src.engine.BandwidthSender", BootstrapSender
+        ):
+            decoder._reset_state()
+
+        self.assertEqual(
+            [item[2] for item in decoder.sender.submissions],
+            [1, 1, 4, 4, 16, 16, 64, 64],
+        )
+        for _, payload, _ in decoder.sender.submissions:
+            self.assertEqual(payload["prob_transport"], "lazy_distribution")
+            self.assertTrue(all(isinstance(value, float) for value in payload["probs"]))
+        regression = decoder.environment_estimator.communication_regression()
+        self.assertTrue(regression["accepted"])
+        self.assertEqual(regression["regression_axis"], "payload_bytes")
+        self.assertEqual(regression["min_samples_per_size"], 2)
+        self.assertAlmostEqual(decoder.initial_token_size_MB, 0.000012, places=9)
 
     def test_resolve_merge_plan_supports_immediate_policy(self):
         decoder = DummyDecoding(make_args(algorithm="pipesd", verify_strategy="hybrid", merge_policy="immediate"))

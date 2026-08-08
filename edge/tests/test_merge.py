@@ -90,6 +90,76 @@ class MergeModuleTests(unittest.TestCase):
 
         self.assertEqual(estimator.missing_batch_sizes(range(1, 9)), [2, 4, 5, 6, 7, 8])
 
+    def test_payload_aware_regression_uses_medians_and_wire_bytes(self):
+        from src.merge import OnlineEnvironmentEstimator
+
+        estimator = OnlineEnvironmentEstimator(
+            history_size=100,
+            min_comm_samples=4,
+            communication_regression_axis="payload_bytes",
+            min_samples_per_size=3,
+            min_comm_r_squared=0.99,
+        )
+        bandwidth_bytes_per_second = 2_500_000.0
+        for token_count in (1, 16, 256, 4096):
+            payload_bytes = 80 + 12 * token_count
+            expected = 0.03 + payload_bytes / bandwidth_bytes_per_second
+            for jitter in (-0.0002, 0.0, 0.0002):
+                estimator.observe_communication(
+                    token_count,
+                    expected + jitter,
+                    payload_bytes=payload_bytes,
+                )
+
+        regression = estimator.communication_regression()
+        estimates = estimator.estimate()
+
+        self.assertTrue(regression["accepted"])
+        self.assertEqual(regression["regression_axis"], "payload_bytes")
+        self.assertAlmostEqual(regression["r_squared"], 1.0, places=9)
+        self.assertAlmostEqual(regression["bytes_per_token"], 12.0, places=6)
+        self.assertAlmostEqual(regression["effective_bandwidth_MBps"], 2.5, places=6)
+        self.assertAlmostEqual(estimates["alpha"], 0.030032, places=6)
+        self.assertAlmostEqual(estimates["beta"], 0.0000048, places=9)
+
+    def test_payload_aware_regression_rejects_low_confidence_fit(self):
+        from src.merge import OnlineEnvironmentEstimator
+
+        estimator = OnlineEnvironmentEstimator(
+            history_size=100,
+            min_comm_samples=4,
+            communication_regression_axis="payload_bytes",
+            min_samples_per_size=1,
+            min_comm_r_squared=0.99,
+        )
+        for token_count, elapsed in zip(
+            (1, 16, 256, 4096),
+            (0.030, 0.050, 0.031, 0.049),
+        ):
+            estimator.observe_communication(
+                token_count,
+                elapsed,
+                payload_bytes=80 + 12 * token_count,
+            )
+
+        regression = estimator.communication_regression()
+
+        self.assertFalse(regression["accepted"])
+        self.assertEqual(regression["rejection_reason"], "r_squared_below_threshold")
+        self.assertNotIn("alpha", estimator.estimate())
+        self.assertNotIn("beta", estimator.estimate())
+
+    def test_missing_bootstrap_sizes_accounts_for_repetitions(self):
+        from src.merge import OnlineEnvironmentEstimator
+
+        estimator = OnlineEnvironmentEstimator(history_size=100, min_comm_samples=2)
+        estimator.observe_communication(1, 0.1, payload_bytes=100)
+
+        self.assertEqual(
+            estimator.missing_batch_sizes((1, 4), repetitions=3),
+            [1, 1, 4, 4, 4],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

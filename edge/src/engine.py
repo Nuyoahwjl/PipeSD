@@ -41,6 +41,8 @@ DELAY_ENDPOINT = f"{URL}/delay"
 
 max_probs = []
 
+DEFAULT_LAZY_COMM_PROBE_SIZES = (1, 4, 16, 64, 256, 1024, 2048, 4096)
+
 
 def _parse_bandwidth_profile(value: str) -> List[Tuple[float, float]]:
     profile: List[Tuple[float, float]] = []
@@ -133,13 +135,63 @@ class Decoding(ABC):
         self.online_environment_measurement = not getattr(self.args, "disable_online_environment_measurement", False)
         self._environment_lock = threading.Lock()
         self._bootstrap_lock = threading.Lock()
-        self.environment_estimator = OnlineEnvironmentEstimator(
-            history_size=getattr(self.args, "schedule_history_size", 100),
-            min_comm_samples=getattr(self.args, "regression_min_comm_samples", 8),
+        if self.prob_transport == 'lazy_distribution':
+            raw_probe_sizes = getattr(
+                self.args,
+                'lazy_comm_probe_sizes',
+                ','.join(str(size) for size in DEFAULT_LAZY_COMM_PROBE_SIZES),
+            )
+            try:
+                self._communication_probe_sizes = tuple(sorted({
+                    int(value.strip())
+                    for value in str(raw_probe_sizes).split(',')
+                    if value.strip() and int(value.strip()) > 0
+                }))
+            except ValueError as exc:
+                raise ValueError(
+                    'lazy_comm_probe_sizes must be comma-separated positive integers'
+                ) from exc
+            if len(self._communication_probe_sizes) < 2:
+                raise ValueError('lazy_comm_probe_sizes must contain at least two sizes')
+            self._communication_probe_repetitions = max(
+                1, int(getattr(self.args, 'lazy_comm_probe_repetitions', 3))
+            )
+            communication_regression_axis = 'payload_bytes'
+            min_comm_r_squared = float(
+                getattr(self.args, 'lazy_comm_min_r_squared', 0.8)
+            )
+        else:
+            self._communication_probe_sizes = tuple(range(1, 9))
+            self._communication_probe_repetitions = 1
+            communication_regression_axis = 'token_count'
+            min_comm_r_squared = 0.0
+
+        configured_min_comm_samples = int(
+            getattr(self.args, "regression_min_comm_samples", 8)
         )
+        estimator_min_comm_samples = min(
+            configured_min_comm_samples,
+            len(self._communication_probe_sizes),
+        )
+        estimator_history_size = max(
+            int(getattr(self.args, "schedule_history_size", 100)),
+            len(self._communication_probe_sizes)
+            * self._communication_probe_repetitions,
+        )
+        self.environment_estimator = OnlineEnvironmentEstimator(
+            history_size=estimator_history_size,
+            min_comm_samples=estimator_min_comm_samples,
+            communication_regression_axis=communication_regression_axis,
+            min_samples_per_size=self._communication_probe_repetitions,
+            min_comm_r_squared=min_comm_r_squared,
+        )
+        initial_token_size_MB = float(self.args.token_size_MB)
+        if self.prob_transport == 'lazy_distribution':
+            initial_token_size_MB = self._estimate_lazy_wire_token_size_MB()
+        self.initial_token_size_MB = initial_token_size_MB
         self.dp_scheduler = PaperDPScheduler(
             alpha=self.software_uplink_startup_seconds + self.software_downlink_startup_seconds,
-            beta=(self.args.token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
+            beta=(initial_token_size_MB / self.bandwidth_MBps) if self.bandwidth_MBps else 0.0,
             gamma=getattr(self.args, "initial_generation_gamma", None)
             or getattr(self.args, "default_token_compute", None)
             or 0.036,
@@ -255,41 +307,63 @@ class Decoding(ABC):
             return [max(1, int(self.dp_scheduler.window))]
         return [max(1, int(self.max_generated_len))]
 
+    def _communication_probe_payload(self, batch_size: int) -> Dict[str, object]:
+        vocab_size = int(getattr(self.args, 'vocab_size', 32000))
+        if self.prob_transport == 'lazy_distribution':
+            # A representative non-trivial token id models its msgpack integer
+            # width more faithfully than token zero.
+            probe_token = max(0, vocab_size - 1)
+            probe_probability = 0.0
+        else:
+            probe_token = 0
+            probe_probability = [0.0] * vocab_size
+        payload = {
+            'type': 'communication_probe',
+            'tokens': [probe_token] * batch_size,
+            'probs': [probe_probability] * batch_size,
+            'token_count': batch_size,
+        }
+        if self.prob_transport == 'lazy_distribution':
+            payload['prob_transport'] = 'lazy_distribution'
+        return payload
+
+    def _estimate_lazy_wire_token_size_MB(self) -> float:
+        """Estimate the scalar proposal's serialized bytes per draft token."""
+        small_size = self._communication_probe_sizes[0]
+        large_size = self._communication_probe_sizes[-1]
+        small_payload = msgpack.packb(self._communication_probe_payload(small_size))
+        large_payload = msgpack.packb(self._communication_probe_payload(large_size))
+        byte_delta = len(large_payload) - len(small_payload)
+        token_delta = large_size - small_size
+        if byte_delta <= 0 or token_delta <= 0:
+            # token id plus one float64 msgpack scalar; only used by test stubs
+            # or an unexpected serializer that does not expose byte length.
+            return 12.0 / 1_000_000.0
+        return (byte_delta / token_delta) / 1_000_000.0
+
     def _ensure_communication_bootstrap(self, force_initial: bool = False) -> None:
-        """Collect the paper's 1--8 token-batch communication probes."""
+        """Collect mode-specific token-batch communication probes."""
         if not self.online_environment_measurement or not self._uses_dp_scheduler() or not hasattr(self, "sender"):
             return
         with self._bootstrap_lock:
             with self._environment_lock:
                 sample_count = len(self.environment_estimator.comm_samples)
-                missing_sizes = self.environment_estimator.missing_batch_sizes(range(1, 9))
+                missing_sizes = self.environment_estimator.missing_batch_sizes(
+                    self._communication_probe_sizes,
+                    repetitions=self._communication_probe_repetitions,
+                )
                 history_full = sample_count >= self.environment_estimator.history_size
-            if force_initial and sample_count > 0:
-                force_initial = False
             if not missing_sizes or (not force_initial and not history_full):
                 return
 
-            vocab_size = int(getattr(self.args, 'vocab_size', 32000))
-            probe_probability = (
-                0.0
-                if self.prob_transport == 'lazy_distribution'
-                else [0.0] * vocab_size
-            )
-            for batch_size in missing_sizes:
-                probe_payload = {
-                    'type': 'communication_probe',
-                    'tokens': [0] * batch_size,
-                    'probs': [probe_probability] * batch_size,
-                    'token_count': batch_size,
-                }
-                if self.prob_transport == 'lazy_distribution':
-                    probe_payload['prob_transport'] = 'lazy_distribution'
+            for probe_index, batch_size in enumerate(missing_sizes):
+                probe_payload = self._communication_probe_payload(batch_size)
                 payload = msgpack.packb(probe_payload)
                 future = self.sender.submit(
                     DELAY_ENDPOINT,
                     payload,
                     headers={"Content-Type": "application/octet-stream"},
-                    tag=f"comm-bootstrap-{batch_size}",
+                    tag=f"comm-bootstrap-{batch_size}-{probe_index}",
                     token_count=batch_size,
                     measurement_kind="transport",
                 )
@@ -322,7 +396,11 @@ class Decoding(ABC):
         if token_count is None or elapsed_seconds is None:
             return
         with self._environment_lock:
-            self.environment_estimator.observe_communication(int(token_count), float(elapsed_seconds))
+            self.environment_estimator.observe_communication(
+                int(token_count),
+                float(elapsed_seconds),
+                payload_bytes=measurement.get("payload_size"),
+            )
             estimates = self.environment_estimator.estimate()
             if estimates:
                 self.dp_scheduler.update_parameters(**estimates)
@@ -361,6 +439,9 @@ class Decoding(ABC):
                 float(getattr(self.args, "software_bandwidth_change_interval_s", 20.0))
                 if self.software_bandwidth_profile else None
             ),
+            "initial_token_size_MB": self.initial_token_size_MB,
+            "communication_probe_sizes": list(self._communication_probe_sizes),
+            "communication_probe_repetitions": self._communication_probe_repetitions,
         }
 
     def _record_token_time(self, token_count: int) -> None:

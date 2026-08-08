@@ -1,5 +1,6 @@
 import sys
 from collections import deque
+from statistics import median
 from typing import Deque, Dict, List, Optional, Tuple
 
 
@@ -172,34 +173,74 @@ class PaperDPScheduler:
 class OnlineEnvironmentEstimator:
     """Estimate PipeSD DP parameters from recent runtime measurements."""
 
-    def __init__(self, history_size: int = 100, min_comm_samples: int = 8) -> None:
+    def __init__(
+        self,
+        history_size: int = 100,
+        min_comm_samples: int = 8,
+        *,
+        communication_regression_axis: str = "token_count",
+        min_samples_per_size: int = 1,
+        min_comm_r_squared: float = 0.0,
+    ) -> None:
         if history_size <= 0:
             raise ValueError("history_size must be positive")
         if min_comm_samples <= 1:
             raise ValueError("min_comm_samples must be greater than 1")
+        if communication_regression_axis not in {"token_count", "payload_bytes"}:
+            raise ValueError("communication regression axis must be token_count or payload_bytes")
+        if min_samples_per_size <= 0:
+            raise ValueError("min_samples_per_size must be positive")
+        if not 0.0 <= min_comm_r_squared <= 1.0:
+            raise ValueError("min_comm_r_squared must be between 0 and 1")
         self.min_comm_samples = int(min_comm_samples)
         self.history_size = int(history_size)
-        self.comm_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
+        self.communication_regression_axis = communication_regression_axis
+        self.min_samples_per_size = int(min_samples_per_size)
+        self.min_comm_r_squared = float(min_comm_r_squared)
+        self.comm_samples: Deque[Tuple[int, float, Optional[int]]] = deque(
+            maxlen=history_size
+        )
         self.generation_samples: Deque[Tuple[int, float]] = deque(maxlen=history_size)
 
-    def observe_communication(self, token_count: int, elapsed_seconds: float) -> None:
+    def observe_communication(
+        self,
+        token_count: int,
+        elapsed_seconds: float,
+        payload_bytes: Optional[int] = None,
+    ) -> None:
         if token_count <= 0 or elapsed_seconds <= 0:
             return
-        self.comm_samples.append((int(token_count), float(elapsed_seconds)))
+        normalized_payload_bytes = (
+            int(payload_bytes) if payload_bytes is not None and payload_bytes > 0 else None
+        )
+        self.comm_samples.append(
+            (int(token_count), float(elapsed_seconds), normalized_payload_bytes)
+        )
 
     def observe_generation(self, token_count: int, elapsed_seconds: float) -> None:
         if token_count <= 0 or elapsed_seconds <= 0:
             return
         self.generation_samples.append((int(token_count), float(elapsed_seconds)))
 
-    def missing_batch_sizes(self, required_sizes) -> List[int]:
-        observed = {count for count, _ in self.comm_samples}
-        return [int(size) for size in required_sizes if int(size) not in observed]
+    def missing_batch_sizes(
+        self,
+        required_sizes,
+        repetitions: int = 1,
+    ) -> List[int]:
+        repetitions = max(1, int(repetitions))
+        observed: Dict[int, int] = {}
+        for count, _, _ in self.comm_samples:
+            observed[count] = observed.get(count, 0) + 1
+        missing = []
+        for raw_size in required_sizes:
+            size = int(raw_size)
+            missing.extend([size] * max(0, repetitions - observed.get(size, 0)))
+        return missing
 
     def estimate(self) -> Dict[str, float]:
         estimates: Dict[str, float] = {}
         regression = self.communication_regression()
-        if regression is not None:
+        if regression is not None and regression.get("accepted", True):
             estimates["alpha"] = regression["alpha"]
             estimates["beta"] = regression["beta"]
 
@@ -210,51 +251,177 @@ class OnlineEnvironmentEstimator:
 
         return estimates
 
+    @staticmethod
+    def _linear_regression(points) -> Optional[Dict[str, object]]:
+        if len(points) < 2:
+            return None
+        n = float(len(points))
+        sum_x = sum(float(x) for x, _ in points)
+        sum_y = sum(float(y) for _, y in points)
+        sum_xx = sum(float(x) * float(x) for x, _ in points)
+        sum_xy = sum(float(x) * float(y) for x, y in points)
+        denominator = n * sum_xx - sum_x * sum_x
+        if denominator <= 0:
+            return None
+        slope = (n * sum_xy - sum_x * sum_y) / denominator
+        intercept = (sum_y - slope * sum_x) / n
+        fitted = [intercept + slope * float(x) for x, _ in points]
+        residuals = [float(y) - predicted for (_, y), predicted in zip(points, fitted)]
+        mean_y = sum_y / n
+        ss_res = sum(value * value for value in residuals)
+        ss_tot = sum((float(y) - mean_y) ** 2 for _, y in points)
+        r_squared = (
+            1.0
+            if ss_tot == 0 and ss_res == 0
+            else (0.0 if ss_tot == 0 else 1.0 - ss_res / ss_tot)
+        )
+        return {
+            "intercept": float(intercept),
+            "slope": float(slope),
+            "r_squared": float(r_squared),
+            "residuals": residuals,
+        }
+
     def communication_regression(self) -> Optional[Dict[str, object]]:
         raw_comm = list(self.comm_samples)
-        grouped: Dict[int, List[float]] = {}
-        for count, elapsed in raw_comm:
-            grouped.setdefault(count, []).append(elapsed)
-        comm = [
-            (count, sum(elapsed_values) / len(elapsed_values))
-            for count, elapsed_values in sorted(grouped.items())
-        ]
+        grouped: Dict[int, List[Tuple[float, Optional[int]]]] = {}
+        for count, elapsed, payload_bytes in raw_comm:
+            grouped.setdefault(count, []).append((elapsed, payload_bytes))
         required_distinct_sizes = min(self.min_comm_samples, 8)
-        is_initial_bootstrap = len(raw_comm) == self.min_comm_samples
+        qualified_sizes = [
+            count
+            for count, values in grouped.items()
+            if len(values) >= self.min_samples_per_size
+        ]
+        is_initial_bootstrap = len(qualified_sizes) >= required_distinct_sizes
         is_full_runtime_window = len(raw_comm) >= self.history_size
-        if (is_initial_bootstrap or is_full_runtime_window) and len(comm) >= required_distinct_sizes:
-            n = float(len(comm))
-            sum_x = sum(float(count) for count, _ in comm)
-            sum_y = sum(elapsed for _, elapsed in comm)
-            sum_xx = sum(float(count * count) for count, _ in comm)
-            sum_xy = sum(float(count) * elapsed for count, elapsed in comm)
-            denominator = n * sum_xx - sum_x * sum_x
-            if denominator > 0:
-                beta = (n * sum_xy - sum_x * sum_y) / denominator
-                alpha = (sum_y - beta * sum_x) / n
-                fitted = [alpha + beta * count for count, _ in comm]
-                residuals = [elapsed - predicted for (_, elapsed), predicted in zip(comm, fitted)]
-                mean_y = sum_y / n
-                ss_res = sum(value * value for value in residuals)
-                ss_tot = sum((elapsed - mean_y) ** 2 for _, elapsed in comm)
-                r_squared = 1.0 if ss_tot == 0 and ss_res == 0 else (0.0 if ss_tot == 0 else 1.0 - ss_res / ss_tot)
-                return {
-                    "alpha": max(0.0, alpha),
-                    "beta": max(1e-9, beta),
-                    "r_squared": float(r_squared),
-                    "residuals": residuals,
-                    "samples_per_batch_size": {str(count): len(grouped[count]) for count, _ in comm},
-                    "mean_seconds_per_batch_size": {str(count): elapsed for count, elapsed in comm},
-                    "window_full": is_full_runtime_window,
-                }
-        return None
+        if not (is_initial_bootstrap or is_full_runtime_window):
+            return None
+        grouped = {
+            count: grouped[count] for count in qualified_sizes
+        }
+        if len(grouped) < required_distinct_sizes:
+            return None
+
+        use_median = self.communication_regression_axis == "payload_bytes"
+        elapsed_by_size = {
+            count: (
+                float(median(elapsed for elapsed, _ in values))
+                if use_median
+                else sum(elapsed for elapsed, _ in values) / len(values)
+            )
+            for count, values in sorted(grouped.items())
+        }
+        samples_per_size = {
+            str(count): len(values) for count, values in sorted(grouped.items())
+        }
+
+        if self.communication_regression_axis == "token_count":
+            regression = self._linear_regression(list(elapsed_by_size.items()))
+            if regression is None:
+                return None
+            alpha = float(regression["intercept"])
+            beta = float(regression["slope"])
+            accepted = regression["r_squared"] >= self.min_comm_r_squared
+            result = {
+                "alpha": max(0.0, alpha),
+                "beta": max(1e-9, beta),
+                "r_squared": regression["r_squared"],
+                "residuals": regression["residuals"],
+                "accepted": bool(accepted),
+                "rejection_reason": (
+                    None if accepted else "r_squared_below_threshold"
+                ),
+            }
+        else:
+            payload_by_size = {}
+            for count, values in sorted(grouped.items()):
+                payload_values = [
+                    payload_bytes
+                    for _, payload_bytes in values
+                    if payload_bytes is not None
+                ]
+                if payload_values:
+                    payload_by_size[count] = float(median(payload_values))
+            if len(payload_by_size) < required_distinct_sizes:
+                return None
+
+            common_sizes = sorted(set(payload_by_size) & set(elapsed_by_size))
+            elapsed_vs_payload = self._linear_regression([
+                (payload_by_size[count], elapsed_by_size[count])
+                for count in common_sizes
+            ])
+            payload_vs_tokens = self._linear_regression([
+                (float(count), payload_by_size[count]) for count in common_sizes
+            ])
+            if elapsed_vs_payload is None or payload_vs_tokens is None:
+                return None
+
+            seconds_per_byte = float(elapsed_vs_payload["slope"])
+            payload_intercept = float(payload_vs_tokens["intercept"])
+            bytes_per_token = float(payload_vs_tokens["slope"])
+            alpha = (
+                float(elapsed_vs_payload["intercept"])
+                + seconds_per_byte * payload_intercept
+            )
+            beta = seconds_per_byte * bytes_per_token
+            accepted = (
+                elapsed_vs_payload["r_squared"] >= self.min_comm_r_squared
+                and seconds_per_byte > 0
+                and bytes_per_token > 0
+                and alpha >= 0
+            )
+            rejection_reason = None
+            if elapsed_vs_payload["r_squared"] < self.min_comm_r_squared:
+                rejection_reason = "r_squared_below_threshold"
+            elif seconds_per_byte <= 0:
+                rejection_reason = "non_positive_seconds_per_byte"
+            elif bytes_per_token <= 0:
+                rejection_reason = "non_positive_bytes_per_token"
+            elif alpha < 0:
+                rejection_reason = "negative_alpha"
+            result = {
+                "alpha": max(0.0, alpha),
+                "beta": max(1e-9, beta),
+                "r_squared": elapsed_vs_payload["r_squared"],
+                "residuals": elapsed_vs_payload["residuals"],
+                "accepted": bool(accepted),
+                "rejection_reason": rejection_reason,
+                "seconds_per_byte": seconds_per_byte,
+                "effective_bandwidth_MBps": (
+                    1.0 / (seconds_per_byte * 1_000_000.0)
+                    if seconds_per_byte > 0 else None
+                ),
+                "payload_intercept_bytes": payload_intercept,
+                "bytes_per_token": bytes_per_token,
+                "median_payload_bytes_per_batch_size": {
+                    str(count): payload_by_size[count] for count in common_sizes
+                },
+            }
+
+        result.update({
+            "regression_axis": self.communication_regression_axis,
+            "min_r_squared": self.min_comm_r_squared,
+            "min_samples_per_size": self.min_samples_per_size,
+            "samples_per_batch_size": samples_per_size,
+            "mean_seconds_per_batch_size": {
+                str(count): elapsed for count, elapsed in elapsed_by_size.items()
+            },
+            "window_full": is_full_runtime_window,
+        })
+        return result
 
     def snapshot(self) -> Dict[str, object]:
         return {
             "comm_samples": len(self.comm_samples),
             "generation_samples": len(self.generation_samples),
-            "distinct_comm_batch_sizes": sorted({count for count, _ in self.comm_samples}),
+            "distinct_comm_batch_sizes": sorted({
+                count for count, _, _ in self.comm_samples
+            }),
             "min_comm_samples": self.min_comm_samples,
+            "communication_regression_axis": self.communication_regression_axis,
+            "min_samples_per_size": self.min_samples_per_size,
+            "min_comm_r_squared": self.min_comm_r_squared,
             "estimate": self.estimate(),
             "communication_regression": self.communication_regression(),
         }

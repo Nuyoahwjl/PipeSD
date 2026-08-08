@@ -22,6 +22,8 @@ Intel Core Ultra 9 185H + A800 40 GB 时，应称为“Table 1 场景 1 协议�
 - BO 论文模式为 `(0,1)^2`、GP/Matern、EI、`xi=0.1`、16 次、1 个随机初始点、每候选总计
   20 accepted tokens。旧的“每样本 20 tokens”保留为 `--bo_protocol sample_coverage`。
 - alpha/beta 只使用 `/delay` 探针和不触发验证的 propose 响应；NAV 响应耗时不进入通信回归。
+  `full` 保持原来的 1--8 token 回归；`lazy_distribution` 使用更宽、重复的标量 payload
+  探针，按实际序列化字节数和各尺寸中位数拟合，并只接受达到 R2 门限的回归结果。
 - gamma 覆盖一次真实 token step 的 sample、softmax 与 draft eval；网络等待、NAV 和场景 2/3
   的人工 sleep 均在计时区间之外。
 - Scenario 1 的上行参数是 2.5 MB/s、下行是 25 MB/s。`os` 模式使用 tc/QoS；
