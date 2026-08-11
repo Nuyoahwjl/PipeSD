@@ -1,0 +1,52 @@
+{
+  "makespan_seconds": 300.0,
+  "total_output_tokens": 1536,
+  "num_completed_samples": 12,
+  "total_cloud_energy_joules": 358.35351992579734,
+  "token_throughput_tps": 5.12,
+  "sample_throughput_sps": 0.04,
+  "energy_per_token_joules": 0.23330307286835764,
+  "energy_per_sample_joules": 29.862793327149777,
+  "sample_window_makespan_seconds": 288.06680393218994,
+  "sample_window_token_throughput_tps": 5.332096510369066,
+  "sample_window_sample_throughput_sps": 0.04165700398725833,
+  "sample_latency_p50_seconds": 23.179901957511902,
+  "sample_latency_p95_seconds": 30.091501069068908,
+  "ttft_p50_seconds": 1.0085530197247863,
+  "ttft_p95_seconds": 1.707489730976522,
+  "tokens_by_client": {
+    "0": 1536
+  },
+  "completed_samples_by_client": {
+    "0": 12
+  },
+  "jain_token_throughput_fairness": 1.0,
+  "total_speculative_tokens_verified": 1636,
+  "total_draft_tokens_accepted": 1258,
+  "draft_acceptance_rate": 0.7689486552567237,
+  "cloud_verify_requests": 280,
+  "cloud_actual_batch_size_mean": 1.0,
+  "cloud_actual_batch_size_p95": 1.0,
+  "cloud_batched_request_fraction": 0.0,
+  "cloud_batch_queue_p50_seconds": 0.0020974334329366684,
+  "cloud_batch_queue_p95_seconds": 0.0023391326889395715,
+  "cloud_batch_decode_p50_seconds": 0.013093299698084593,
+  "cloud_batch_decode_p95_seconds": 0.014382295357063413,
+  "cloud_prefill_requests": 24,
+  "cloud_actual_prefill_batch_size_mean": 1.0,
+  "dataset": "humaneval",
+  "algorithm": "vanilla",
+  "num_clients": 1,
+  "pilot_samples": 164,
+  "workload_mode": "replicated",
+  "base_tag": "20260809-070023_vanilla_full_c1",
+  "warmup_seconds": 30.0,
+  "measurement_duration_seconds": 300.0,
+  "measurement_window_start": 1786258859.3945227,
+  "measurement_window_end": 1786259159.3945227,
+  "excluded_warmup_or_partial_samples": 2,
+  "cpu_sets": [
+    "4-5"
+  ],
+  "barrier_dir": "exp/barriers/20260809-070023_vanilla_full_c1-990134-1786258826"
+}
