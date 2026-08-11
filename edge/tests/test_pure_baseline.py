@@ -100,7 +100,7 @@ class PureBaselineTest(unittest.TestCase):
 
         self.assertEqual(
             (pure_cloud.seed, pure_cloud.threads, pure_cloud.ctx_size),
-            (1234, 1, 1024),
+            (3407, 1, 1024),
         )
         self.assertEqual(
             (pure_cloud.temp, pure_cloud.top_k, pure_cloud.top_p),
@@ -108,11 +108,11 @@ class PureBaselineTest(unittest.TestCase):
         )
         self.assertEqual(
             (pure_edge.seed, pure_edge.threads, pure_edge.ctx_size),
-            (1234, 2, 16384),
+            (3407, 1, 1024),
         )
         self.assertEqual(
             (pure_edge.temp, pure_edge.top_k, pure_edge.top_p),
-            (0.0, 1, 0.95),
+            (0.0, 1, 1.0),
         )
 
     def test_generate_one_stops_at_eos_and_has_no_nav(self):

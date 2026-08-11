@@ -87,13 +87,15 @@ class CompareFourModesTest(unittest.TestCase):
         self.assertEqual(totals["network_transfers"], 4)
         self.assertEqual(totals["network_service_seconds"], 2.5)
 
-    def test_formatter_distinguishes_not_applicable_from_missing(self):
+    def test_formatter_marks_local_network_not_applicable(self):
         pure = {"method": "pure_cloud", "network_shaping_mode": None}
         serial = {"method": "vanilla", "network_shaping_mode": "software"}
         self.assertEqual(
-            MODULE.fmt_for_method(pure, None, applies_to="collaborative"), "—"
+            MODULE.fmt_for_method(pure, None, applies_to="speculative"), "missing"
         )
-        self.assertEqual(MODULE.fmt_for_method(serial, None), "missing")
+        self.assertEqual(
+            MODULE.fmt_for_method(pure, None, applies_to="network"), "—"
+        )
 
     def test_pure_cloud_warning_explains_timing_boundary(self):
         warnings = MODULE.comparability_warnings(
@@ -108,7 +110,7 @@ class CompareFourModesTest(unittest.TestCase):
                 }
             ]
         )
-        self.assertTrue(any("warm-model local request" in item for item in warnings))
+        self.assertTrue(any("co-locates draft and target" in item for item in warnings))
 
     def test_normalize_result_derives_average_power_from_energy_and_total_time(self):
         payload = {
@@ -190,7 +192,7 @@ class CompareFourModesTest(unittest.TestCase):
         self.assertEqual(row["actual_output_tokens"], 1200)
         self.assertEqual(
             row["tpt_normalization_token_type"],
-            "cloud_accepted_draft_tokens",
+            "target_accepted_draft_tokens",
         )
         self.assertAlmostEqual(row["tpt_ms"], 4.0)
         self.assertAlmostEqual(row["throughput_tokens_per_second"], 250.0)
@@ -282,7 +284,7 @@ class CompareFourModesTest(unittest.TestCase):
         markdown = MODULE.build_markdown("humaneval", rows, [])
 
         self.assertIn("exactly 1,000 benchmark-normalization tokens", markdown)
-        self.assertIn("Collaborative modes use cloud-accepted draft tokens", markdown)
+        self.assertIn("All four modes use target-accepted draft tokens", markdown)
         self.assertIn("Avg power W", markdown)
         self.assertIn("400.000", markdown)
         self.assertIn("| Pure Edge (local-only) | -- | -- |", markdown)
@@ -290,7 +292,7 @@ class CompareFourModesTest(unittest.TestCase):
     def test_default_output_is_beside_dataset_experiments(self):
         self.assertEqual(
             MODULE.resolve_output_dir("gsm8k", "four_mode_s1_paper"),
-            Path("exp/exp__wjl__four__modes/gsm8k/comparison/four_mode_s1_paper"),
+            Path("exp/exp__wjl/gsm8k/comparison/four_mode_s1_paper"),
         )
 
 

@@ -1,4 +1,8 @@
-# Pure Cloud / Pure Edge / Serial SD / PipeSD evaluation
+# Legacy four-mode notes
+
+> This document describes the retired single-model Pure Cloud/Pure Edge
+> baseline. The current dual-model fixed-window SD protocol is documented in
+> [four-mode-local-speculative-evaluation.md](four-mode-local-speculative-evaluation.md).
 
 This extension adds two standalone single-model baselines without changing the
 existing speculative-decoding engine or cloud API:

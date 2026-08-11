@@ -81,4 +81,5 @@ commands, metrics, and correctness evaluation, see
 
 For the deployment comparison requested by the reproduction assignment—Pure
 Cloud, Pure Edge, serial Edge-Cloud SD (the existing Vanilla algorithm), and
-PipeSD—see [`docs/four-mode-evaluation.md`](docs/four-mode-evaluation.md).
+PipeSD—see
+[`docs/four-mode-local-speculative-evaluation.md`](docs/four-mode-local-speculative-evaluation.md).

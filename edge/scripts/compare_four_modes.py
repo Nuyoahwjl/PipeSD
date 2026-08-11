@@ -15,8 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 METHODS = ("pure_cloud", "pure_edge", "vanilla", "pipesd")
 DISPLAY_NAMES = {
-    "pure_cloud": "Pure Cloud ",
-    "pure_edge": "Pure Edge ",
+    "pure_cloud": "Pure Cloud SD",
+    "pure_edge": "Pure Edge SD",
     "vanilla": "Serial Edge-Cloud SD",
     "pipesd": "PipeSD",
 }
@@ -72,6 +72,12 @@ def load_candidates(
         if method not in METHODS or current_dataset not in {"humaneval", "gsm8k"}:
             continue
         if summary.get("evaluation_protocol") != "paper_table1":
+            continue
+        if method in {"pure_cloud", "pure_edge"} and summary.get(
+            "actual_accepted_draft_tokens"
+        ) is None:
+            # Do not silently mix the retired single-model AR pure baselines
+            # with the current dual-model local speculative-decoding protocol.
             continue
         if dataset and current_dataset != dataset:
             continue
@@ -172,12 +178,12 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     summary = payload.get("summary", {})
     samples = payload.get("samples", [])
     method = str(manifest["algorithm"])
-    collaborative = method in {"vanilla", "pipesd"}
+    speculative = method in METHODS
     output_tokens = int(summary.get("actual_output_tokens", 0) or 0)
     accepted_value = (
-        summary.get("actual_accepted_draft_tokens") if collaborative else None
+        summary.get("actual_accepted_draft_tokens") if speculative else None
     )
-    if collaborative and accepted_value is None:
+    if speculative and accepted_value is None:
         samples_with_acceptance = [
             sample for sample in samples if "verify_accept_lengths" in sample
         ]
@@ -189,10 +195,10 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     accepted_tokens = (
         int(accepted_value) if accepted_value is not None else None
     )
-    tokens = int(accepted_tokens or 0) if collaborative else output_tokens
+    tokens = int(accepted_tokens or 0) if speculative else output_tokens
     normalization_token_type = (
-        "cloud_accepted_draft_tokens"
-        if collaborative
+        "target_accepted_draft_tokens"
+        if speculative
         else "committed_output_tokens"
     )
     total_time = float(summary.get("total_time_seconds", 0.0) or 0.0)
@@ -243,8 +249,6 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         "downlink_bandwidth_MBps": manifest.get("downlink_bandwidth_MBps"),
         "target_tokens": (
             summary.get("target_accepted_draft_tokens", summary.get("target_output_tokens"))
-            if collaborative
-            else summary.get("target_output_tokens")
         ),
         "actual_tokens": tokens,
         "actual_accepted_tokens": accepted_tokens,
@@ -304,7 +308,7 @@ def normalize_result(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
         "verification_frequency": summary.get("verification_frequency"),
         "nav_per_100_tokens": (
             100.0 * int(summary.get("num_verifications", 0) or 0) / tokens
-            if collaborative and tokens
+            if speculative and tokens
             else None
         ),
         "mean_draft_length": summary.get("mean_draft_length"),
@@ -364,8 +368,8 @@ def fmt_for_method(
     percent: bool = False,
     missing_label: str = "missing",
 ) -> str:
-    collaborative = row["method"] in {"vanilla", "pipesd"}
-    if applies_to == "collaborative" and not collaborative:
+    speculative = row["method"] in METHODS
+    if applies_to == "speculative" and not speculative:
         return "—"
     if applies_to == "network" and row.get("network_shaping_mode") is None:
         return "—"
@@ -409,11 +413,11 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
                 none_label="--" if row["method"] == "pure_edge" else "missing",
             ),
             row["energy_scope"],
-            fmt_for_method(row, row["nav_per_100_tokens"], applies_to="collaborative"),
-            fmt_for_method(row, row["mean_draft_length"], applies_to="collaborative"),
-            fmt_for_method(row, row["acceptance_rate"], applies_to="collaborative", percent=True),
-            fmt_for_method(row, row["rollback_rate"], applies_to="collaborative", percent=True),
-            fmt_for_method(row, row["mean_actual_batch_size"], applies_to="collaborative"),
+            fmt_for_method(row, row["nav_per_100_tokens"], applies_to="speculative"),
+            fmt_for_method(row, row["mean_draft_length"], applies_to="speculative"),
+            fmt_for_method(row, row["acceptance_rate"], applies_to="speculative", percent=True),
+            fmt_for_method(row, row["rollback_rate"], applies_to="speculative", percent=True),
+            fmt_for_method(row, row["mean_actual_batch_size"], applies_to="speculative"),
         ]
         for row in rows
     ]
@@ -480,10 +484,9 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
             "> Every selected run contains exactly 1,000 benchmark-normalization tokens, "
             "so TPT in ms/token is numerically equal to total measured time in seconds: "
             "TPT = total_time_seconds × 1000 / 1000. The report retains both "
-            "columns. Collaborative modes use cloud-accepted draft tokens; pure modes "
-            "use committed output tokens because they have no NAV acceptance stage."
+            "columns. All four modes use target-accepted draft tokens."
             if rows and all(row.get("actual_tokens") == 1000 for row in rows)
-            else "> TPT(ms/token) = total_time_seconds × 1000 / normalization_tokens. Collaborative modes use cloud-accepted draft tokens; pure modes use committed output tokens."
+            else "> TPT(ms/token) = total_time_seconds × 1000 / target-accepted draft tokens for all four modes."
         ),
         "",
         markdown_table(
@@ -493,7 +496,7 @@ def build_markdown(dataset: str, rows: Sequence[Dict[str, Any]], warnings: Seque
         "",
         "## Energy and speculative-decoding behavior",
         "",
-        "> Energy is normalized by the same benchmark-token denominator as TPT. Pure Cloud energy covers prompt prefill plus the complete autoregressive decode. Average power uses the recorded energy-window duration when available; legacy artifacts fall back to reported total time.",
+        "> Energy is normalized by target-accepted draft tokens. Pure Cloud energy covers co-located draft/target prompt prefill and speculative decode. Average power uses the recorded energy-window duration when available; legacy artifacts fall back to reported total time.",
         "",
         markdown_table(
             ["Method", "Measured energy J/100 benchmark tokens↓", "Avg power W↓", "Energy scope", "NAV/100↓", "Draft len", "Accept↑", "Rollback↓", "Batch size"],
@@ -529,14 +532,13 @@ def comparability_warnings(rows: Sequence[Dict[str, Any]]) -> List[str]:
         warnings.append("Result tags differ; confirm that all runs belong to the same scenario.")
     if any(row["method"] == "pure_cloud" for row in rows):
         warnings.append(
-            "Pure Cloud (model-only) TPT covers the warm-model local request end to end "
-            "and excludes model load and client-cloud transfer; its energy covers prompt "
-            "prefill plus complete decode. Collaborative modes include emulated transport."
+            "Pure Cloud SD co-locates draft and target and excludes client-cloud transfer; "
+            "Serial Edge-Cloud SD and PipeSD include emulated transport."
         )
     collaborative = [row for row in rows if row["method"] in {"vanilla", "pipesd"}]
-    if any(row.get("mean_ttft_ms") is None for row in collaborative):
+    if any(row.get("mean_ttft_ms") is None for row in rows):
         warnings.append(
-            "At least one collaborative artifact predates TTFT instrumentation; rerun Serial SD and PipeSD."
+            "At least one artifact predates TTFT instrumentation; rerun the affected mode."
         )
     if any(
         row["method"] != "pure_edge"
@@ -573,8 +575,7 @@ def comparability_warnings(rows: Sequence[Dict[str, Any]]) -> List[str]:
     }
     if len(energy_units) > 1:
         warnings.append(
-            "Energy-per-100 values use different token denominators (accepted draft "
-            "tokens versus committed output tokens) and are not directly comparable."
+            "Energy-per-100 values use different token denominators and are not directly comparable."
         )
     return warnings
 
